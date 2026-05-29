@@ -320,8 +320,9 @@ with tab_timeline:
                 text=ht["text"],
             ))
 
+    ribbon_layout = {**PLOTLY_LAYOUT, "margin": dict(l=16, r=16, t=40, b=40)}
     fig.update_layout(
-        **PLOTLY_LAYOUT,
+        **ribbon_layout,
         shapes=shapes,
         height=140,
         xaxis=dict(showgrid=False, title=None, rangeslider=dict(visible=True, thickness=0.12)),
@@ -330,7 +331,6 @@ with tab_timeline:
             orientation="h", yanchor="bottom", y=1.08,
             xanchor="left", x=0, itemsizing="constant",
         ),
-        margin=dict(l=16, r=16, t=40, b=40),
     )
     st.plotly_chart(fig, use_container_width=True)
 
