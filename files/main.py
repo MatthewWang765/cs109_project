@@ -106,6 +106,9 @@ def main():
     states, log_prob = model.decode(X_norm)
     print(f"\nViterbi log-prob: {log_prob:.4f}")
 
+    # --- Posterior (full Bayesian probabilities, not just MAP) ---
+    gamma = model.posterior(X_norm)
+
     print("\n=== Regime duration statistics ===")
     for k in range(args.K):
         days_in_k = (states == k).sum()
@@ -122,6 +125,7 @@ def main():
     np.save("outputs/sigmas.npy", model.sigmas)
     np.save("outputs/A.npy", model.A)
     np.save("outputs/log_likelihoods.npy", np.array(model.log_likelihoods))
+    np.save("outputs/gamma.npy", gamma)
     if dates is not None:
         import pandas as pd
         pd.Series(states, index=dates).to_csv("outputs/decoded_states_dated.csv", header=["state"])

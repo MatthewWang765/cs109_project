@@ -62,27 +62,28 @@ def load_netcdf(precip_path, et_path):
     df = pd.DataFrame({"precip_mm": precip_monthly, "et_mm": et_monthly})
     df = df[(df.index.year >= 2000) & (df.index.year <= 2020)].dropna()
 
-    # ── 3-month rolling sums → standardised anomalies (SPI/SPEI style) ─────
-    # Monthly anomalies are noisy and the HMM with K=4 latches onto seasonal
-    # variance structure rather than drought episodes. A 3-month rolling
-    # window smooths month-to-month noise and isolates the multi-month
-    # drought signal that's climatologically meaningful.
-    # Then z-score by calendar month (no std floor — the true per-month std
-    # is computed from 21 years of data, which is enough).
-    df["precip_3mo"] = df["precip_mm"].rolling(3, min_periods=1).sum()
-    df["et_3mo"]     = df["et_mm"].rolling(3, min_periods=1).sum()
+    # ── 12-month rolling sums → SPI-12 / ETI-12 ──────────────────────────────
+    # Multi-year droughts (e.g., California 2012–2017) are by definition
+    # cumulative water deficits that build over many months. SPI-3 captures
+    # seasonal anomalies but misses the multi-year buildup; SPI-12 is the
+    # standard index for long-term drought used by the U.S. Drought Monitor.
+    # We z-score by calendar month so each month's anomaly is comparable.
+    WIN = 12
+    df["precip_win"] = df["precip_mm"].rolling(WIN, min_periods=WIN).sum()
+    df["et_win"]     = df["et_mm"].rolling(WIN, min_periods=WIN).sum()
+    df = df.dropna(subset=["precip_win", "et_win"])    # drops first WIN-1 months
 
-    clim_mean = df[["precip_3mo", "et_3mo"]].groupby(df.index.month).mean()
-    clim_std  = df[["precip_3mo", "et_3mo"]].groupby(df.index.month).std()
+    clim_mean = df[["precip_win", "et_win"]].groupby(df.index.month).mean()
+    clim_std  = df[["precip_win", "et_win"]].groupby(df.index.month).std()
 
     months = df.index.month
     df["precip_anom"] = (
-        (df["precip_3mo"].values - clim_mean.loc[months, "precip_3mo"].values)
-        / clim_std.loc[months, "precip_3mo"].values
+        (df["precip_win"].values - clim_mean.loc[months, "precip_win"].values)
+        / clim_std.loc[months, "precip_win"].values
     )
     df["et_anom"] = (
-        (df["et_3mo"].values - clim_mean.loc[months, "et_3mo"].values)
-        / clim_std.loc[months, "et_3mo"].values
+        (df["et_win"].values - clim_mean.loc[months, "et_win"].values)
+        / clim_std.loc[months, "et_win"].values
     )
     df = df.dropna(subset=["precip_anom", "et_anom"])
 

@@ -187,6 +187,23 @@ class GaussianHMM:
         log_B = compute_log_emission_matrix(X, self.mus, self.sigmas)
         return viterbi(log_B, self.A, self.pi)
 
+    def posterior(self, X):
+        """
+        Smoothed posterior P(Z_t = k | X_{1:T}) via forward-backward.
+
+        Unlike Viterbi (which returns one hard label per time step), this
+        returns the full Bayesian posterior — a continuous probability over
+        every state at every time step. This is what lets us produce a
+        drought-intensity gradient instead of discrete state labels.
+
+        Returns
+        -------
+        gamma : (T, K)  posterior state probabilities, rows sum to 1
+        """
+        log_B = compute_log_emission_matrix(X, self.mus, self.sigmas)
+        gamma, _, _ = forward_backward(log_B, self.A, self.pi)
+        return gamma
+
     # ------------------------------------------------------------------
     # Inspection helpers
     # ------------------------------------------------------------------
