@@ -40,13 +40,20 @@ def load_netcdf(precip_path, et_path):
     precip = gpm["precip_mean"].to_series().rename("precip_mm")
     precip.index = pd.DatetimeIndex(precip.index).normalize()
 
-    # Monthly ET mean (mm/month) → convert to mm/day, then forward-fill to daily
+    # Monthly ET mean (mm/month) → linearly interpolate to daily
+    # Anchor each monthly value at the 15th (mid-month) so interpolation is
+    # centred rather than stepped, avoiding artificial jumps on the 1st.
     et_monthly = et_ds["et_mean"].to_series().rename("et_mm")
-    et_monthly.index = pd.DatetimeIndex(et_monthly.index).to_period("M").to_timestamp("M") - pd.offsets.MonthBegin(1)
+    et_monthly.index = (
+        pd.DatetimeIndex(et_monthly.index).to_period("M").to_timestamp("M")
+        - pd.offsets.MonthBegin(1)
+        + pd.Timedelta(days=14)          # shift to mid-month
+    )
 
-    # Build daily date range and forward-fill monthly ET values
+    # Merge onto daily grid and interpolate between mid-month anchors
     daily_index = precip.index
-    et_daily = et_monthly.reindex(daily_index, method="ffill")
+    et_on_daily = et_monthly.reindex(daily_index.union(et_monthly.index))
+    et_daily = et_on_daily.interpolate(method="time").reindex(daily_index)
 
     df = pd.DataFrame({"precip_mm": precip, "et_mm": et_daily})
     df = df[(df.index.year >= 2000) & (df.index.year <= 2020)]

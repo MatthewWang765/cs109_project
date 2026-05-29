@@ -23,7 +23,7 @@ class GaussianHMM:
     Parameters learned via Baum-Welch (EM).
     """
 
-    def __init__(self, K=4, max_iter=200, tol=1e-4, reg_covar=1e-6, random_state=42):
+    def __init__(self, K=4, max_iter=200, tol=1e-4, reg_covar=0.01, random_state=42):
         """
         Parameters
         ----------

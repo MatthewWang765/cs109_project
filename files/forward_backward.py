@@ -80,13 +80,14 @@ def compute_gamma_xi(alpha, beta, log_B, A):
     gamma /= row_sums
 
     # xi[t, j, k] ∝ alpha[t,j] * A[j,k] * B[t+1,k] * beta[t+1,k]
-    xi = np.zeros((T - 1, K, K))
-    for t in range(T - 1):
-        b_next = np.exp(log_B[t + 1])                 # (K,)
-        # outer: alpha[t][:,None] * A  then multiply each row by b_next*beta[t+1]
-        mat = alpha[t][:, None] * A * (b_next * beta[t + 1])[None, :]
-        total = mat.sum()
-        xi[t] = mat / (total if total > 0 else 1e-300)
+    # Vectorized: broadcast over all T-1 time steps at once
+    B_next = np.exp(log_B[1:])                        # (T-1, K)
+    # alpha[:-1,:,None] * A[None,:,:] * (B_next * beta[1:])[:,None,:]  → (T-1, K, K)
+    xi = (alpha[:-1, :, None]
+          * A[None, :, :]
+          * (B_next * beta[1:])[:, None, :])
+    totals = xi.sum(axis=(1, 2), keepdims=True)
+    xi /= np.where(totals == 0, 1e-300, totals)
 
     return gamma, xi
 
