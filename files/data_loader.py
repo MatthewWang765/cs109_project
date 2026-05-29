@@ -62,11 +62,27 @@ def load_netcdf(precip_path, et_path):
     df = pd.DataFrame({"precip_mm": precip_monthly, "et_mm": et_monthly})
     df = df[(df.index.year >= 2000) & (df.index.year <= 2020)].dropna()
 
-    # ── Remove seasonal climatology → anomalies ─────────────────────────────
-    # Climatological mean for each calendar month (Jan=1 … Dec=12)
-    clim = df.groupby(df.index.month).mean()          # shape (12, 2)
-    df["precip_anom"] = df["precip_mm"] - df.index.map(lambda d: clim.loc[d.month, "precip_mm"])
-    df["et_anom"]     = df["et_mm"]     - df.index.map(lambda d: clim.loc[d.month, "et_mm"])
+    # ── Standardised anomalies (z-score by calendar month) ──────────────────
+    # Subtracting the mean alone doesn't help: summer precip in the SJV is
+    # always ~0 mm, so the raw anomaly is always ~0 regardless of drought.
+    # Dividing by each month's std puts all months on the same scale — a
+    # "−2σ July" and a "−2σ January" both signal anomalous dryness.
+    # A std floor of 5 mm (precip) / 1 mm (ET) avoids division near zero
+    # for months where the signal is nearly constant.
+    clim_mean = df.groupby(df.index.month).mean()
+    clim_std  = df.groupby(df.index.month).std()
+    clim_std["precip_mm"] = clim_std["precip_mm"].clip(lower=5.0)
+    clim_std["et_mm"]     = clim_std["et_mm"].clip(lower=1.0)
+
+    months = df.index.month
+    df["precip_anom"] = (
+        (df["precip_mm"].values - clim_mean.loc[months, "precip_mm"].values)
+        / clim_std.loc[months, "precip_mm"].values
+    )
+    df["et_anom"] = (
+        (df["et_mm"].values - clim_mean.loc[months, "et_mm"].values)
+        / clim_std.loc[months, "et_mm"].values
+    )
 
     X     = df[["precip_anom", "et_anom"]].values.astype(float)
     dates = df.index
