@@ -152,6 +152,19 @@ def run_and_cache_model():
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+def smooth_states(s_arr, window):
+    """Rolling majority vote over a centred window (display only, model unchanged)."""
+    if window <= 1:
+        return s_arr
+    half = window // 2
+    out = s_arr.copy()
+    for i in range(len(s_arr)):
+        lo, hi = max(0, i - half), min(len(s_arr), i + half + 1)
+        vals, counts = np.unique(s_arr[lo:hi], return_counts=True)
+        out[i] = vals[np.argmax(counts)]
+    return out
+
+
 def regime_color_list(states):
     return [REGIME_COLORS[s] for s in states]
 
@@ -258,19 +271,6 @@ with tab_timeline:
         min_value=1, max_value=30, value=14, step=1,
         help="Suppresses isolated 1–3 day state flips. Does not change the model.",
     )
-
-    @st.cache_data(show_spinner=False)
-    def smooth_states(s_arr, window):
-        """Rolling majority vote over a centred window."""
-        if window <= 1:
-            return s_arr
-        half = window // 2
-        out = s_arr.copy()
-        for i in range(len(s_arr)):
-            lo, hi = max(0, i - half), min(len(s_arr), i + half + 1)
-            vals, counts = np.unique(s_arr[lo:hi], return_counts=True)
-            out[i] = vals[np.argmax(counts)]
-        return out
 
     display_states = smooth_states(states, smooth_days)
     display_df = obs_df.copy()
