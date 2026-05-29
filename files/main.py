@@ -86,6 +86,13 @@ def main():
     print(f"Precip range: {X[:,0].min():.2f} – {X[:,0].max():.2f} mm/day")
     print(f"ET range:     {X[:,1].min():.2f} – {X[:,1].max():.2f} mm/day")
 
+    # Log1p-transform precip: distribution is heavily right-skewed (mostly 0,
+    # rare large events). Without this, normalized precip is near-zero on ~80%
+    # of days and the HMM separates almost purely on the smooth ET seasonal
+    # signal, producing unrealistically long sticky runs.
+    X[:, 0] = np.log1p(X[:, 0])
+    print(f"Precip after log1p: range {X[:,0].min():.2f} – {X[:,0].max():.2f}")
+
     # Normalize
     X_norm, mean, std = normalize(X)
     print(f"Observation mean: {mean}, std: {std}")

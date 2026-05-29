@@ -97,6 +97,8 @@ def load_outputs():
 def load_obs():
     from data_loader import load_netcdf, normalize
     X, dates = load_netcdf("data/gpm_sjv_subset.nc", "data/openet_sjv_subset.nc")
+    X = X.copy()
+    X[:, 0] = np.log1p(X[:, 0])   # match main.py preprocessing
     X_norm, mean, std = normalize(X)
     return X, X_norm, dates, mean, std
 
@@ -250,43 +252,85 @@ tab_timeline, tab_obs, tab_params, tab_duration, tab_convergence = st.tabs([
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_timeline:
     st.markdown("### Decoded Drought Regimes — Daily, 2000–2020")
-    st.caption(
-        "Each point is one day, coloured by Viterbi-decoded hidden state. "
-        "Drag to zoom, double-click to reset."
-    )
+    st.caption("Coloured ribbon showing Viterbi-decoded hidden state. Drag to zoom, double-click to reset.")
 
-    # Build a continuous colored scatter using one trace per state so the
-    # legend is clean; sort traces so the rarest appear on top.
+    # ── Build run-length encoded segments for a Gantt-style ribbon ──
+    # Each contiguous run becomes one rectangle; far fewer shapes than 7k points.
+    def rle_segments(df):
+        """Return DataFrame of {start, end, state} for each contiguous run."""
+        rows = []
+        cur_state = df["state"].iloc[0]
+        cur_start = df.index[0]
+        for ts, row in df.iterrows():
+            if row["state"] != cur_state:
+                rows.append({"start": cur_start, "end": ts, "state": cur_state})
+                cur_state = row["state"]
+                cur_start = ts
+        rows.append({"start": cur_start, "end": df.index[-1], "state": cur_state})
+        return pd.DataFrame(rows)
+
+    segs = rle_segments(obs_df)
+
     fig = go.Figure()
-    for k in sorted(REGIME_COLORS, key=lambda k: -(states == k).sum()):
-        mask = obs_df["state"] == k
+    # One invisible scatter per regime just to get a clean legend
+    for k in range(4):
         fig.add_trace(go.Scatter(
-            x=obs_df.index[mask],
-            y=obs_df.loc[mask, "state"],
+            x=[None], y=[None],
             mode="markers",
+            marker=dict(color=REGIME_COLORS[k], size=10, symbol="square"),
             name=REGIME_LABELS[k],
-            marker=dict(color=REGIME_COLORS[k], size=3, opacity=0.75),
-            hovertemplate=(
-                "<b>%{x|%Y-%m-%d}</b><br>"
-                f"Regime: {REGIME_LABELS[k]}<extra></extra>"
-            ),
+            showlegend=True,
         ))
+
+    # Add all segments as filled rectangles via shapes
+    shapes = []
+    hover_traces = {k: {"x": [], "y": [], "text": []} for k in range(4)}
+    for _, seg in segs.iterrows():
+        k = int(seg["state"])
+        dur = (seg["end"] - seg["start"]).days + 1
+        shapes.append(dict(
+            type="rect",
+            x0=seg["start"], x1=seg["end"],
+            y0=0, y1=1,
+            fillcolor=REGIME_COLORS[k],
+            opacity=0.85,
+            line_width=0,
+            layer="below",
+        ))
+        # One hover point per segment at midpoint
+        mid = seg["start"] + (seg["end"] - seg["start"]) / 2
+        hover_traces[k]["x"].append(mid)
+        hover_traces[k]["y"].append(0.5)
+        hover_traces[k]["text"].append(
+            f"{seg['start'].strftime('%Y-%m-%d')} → {seg['end'].strftime('%Y-%m-%d')}<br>{dur} days"
+        )
+
+    for k in range(4):
+        ht = hover_traces[k]
+        if ht["x"]:
+            fig.add_trace(go.Scatter(
+                x=ht["x"], y=ht["y"],
+                mode="markers",
+                marker=dict(color="rgba(0,0,0,0)", size=8),
+                showlegend=False,
+                hovertemplate=(
+                    f"<b>{REGIME_LABELS[k]}</b><br>"
+                    "%{text}<extra></extra>"
+                ),
+                text=ht["text"],
+            ))
 
     fig.update_layout(
         **PLOTLY_LAYOUT,
-        height=280,
-        yaxis=dict(
-            tickmode="array",
-            tickvals=[0, 1, 2, 3],
-            ticktext=[REGIME_LABELS[k] for k in range(4)],
-            showgrid=False,
-        ),
-        xaxis=dict(showgrid=False, title=None),
+        shapes=shapes,
+        height=140,
+        xaxis=dict(showgrid=False, title=None, rangeslider=dict(visible=True, thickness=0.12)),
+        yaxis=dict(visible=False, range=[0, 1]),
         legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
+            orientation="h", yanchor="bottom", y=1.08,
             xanchor="left", x=0, itemsizing="constant",
         ),
-        showlegend=True,
+        margin=dict(l=16, r=16, t=40, b=40),
     )
     st.plotly_chart(fig, use_container_width=True)
 

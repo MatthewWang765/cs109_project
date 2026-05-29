@@ -50,10 +50,18 @@ def load_netcdf(precip_path, et_path):
         + pd.Timedelta(days=14)          # shift to mid-month
     )
 
-    # Merge onto daily grid and interpolate between mid-month anchors
+    # Merge onto daily grid and interpolate between mid-month anchors;
+    # back-fill the leading edge (days before the first mid-month anchor)
+    # and forward-fill the trailing edge so no days are dropped.
     daily_index = precip.index
     et_on_daily = et_monthly.reindex(daily_index.union(et_monthly.index))
-    et_daily = et_on_daily.interpolate(method="time").reindex(daily_index)
+    et_daily = (
+        et_on_daily
+        .interpolate(method="time")
+        .bfill()    # fills days before Jan 15 2000
+        .ffill()    # fills any trailing days after last anchor
+        .reindex(daily_index)
+    )
 
     df = pd.DataFrame({"precip_mm": precip, "et_mm": et_daily})
     df = df[(df.index.year >= 2000) & (df.index.year <= 2020)]
