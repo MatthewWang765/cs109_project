@@ -36,17 +36,17 @@ st.set_page_config(
 # ── design tokens ─────────────────────────────────────────────────────────────
 # Earthy, drought-appropriate palette — one color per regime
 REGIME_COLORS = {
-    0: "#D97B4F",   # amber-orange  → hot-dry
-    1: "#5B8DB8",   # steel-blue    → wet / rainy
-    2: "#B94040",   # brick-red     → severe drought
-    3: "#7A8C7E",   # sage-grey     → cold-dry / winter
+    0: "#7A8C7E",   # sage-grey  → cool-normal
+    1: "#5B8DB8",   # steel-blue → wet anomaly
+    2: "#B94040",   # brick-red  → warm-dry anomaly
+    3: "#D97B4F",   # amber      → drought (precip deficit)
 }
 
 REGIME_LABELS = {
-    0: "Hot-Dry",
+    0: "Cool-Normal",
     1: "Wet",
-    2: "Severe Drought",
-    3: "Cold-Dry",
+    2: "Warm-Dry",
+    3: "Drought",
 }
 
 PLOTLY_LAYOUT = dict(
@@ -97,8 +97,6 @@ def load_outputs():
 def load_obs():
     from data_loader import load_netcdf, normalize
     X, dates = load_netcdf("data/gpm_sjv_subset.nc", "data/openet_sjv_subset.nc")
-    X = X.copy()
-    X[:, 0] = np.log1p(X[:, 0])   # match main.py preprocessing
     X_norm, mean, std = normalize(X)
     return X, X_norm, dates, mean, std
 
@@ -201,7 +199,7 @@ with st.sidebar:
     st.divider()
 
     st.markdown("**Data**")
-    st.markdown("GPM IMERG daily precip  \nOpenET monthly ET → daily  \n2000-01-01 – 2020-12-31")
+    st.markdown("GPM IMERG precip → monthly totals  \nOpenET monthly ET  \nAnomaly from climatological mean  \n252 months · 2000-01 – 2020-12")
     st.divider()
 
     if not outputs_exist:
@@ -228,7 +226,7 @@ states, mus, sigmas, A, dates, log_likelihoods = load_outputs()
 X, X_norm, obs_dates, obs_mean, obs_std = load_obs()
 
 # Align observations to decoded-state dates
-obs_df = pd.DataFrame(X, index=obs_dates, columns=["precip_mm", "et_mm"])
+obs_df = pd.DataFrame(X, index=obs_dates, columns=["precip_anom", "et_anom"])
 obs_df = obs_df.loc[dates]
 obs_df["state"] = states
 obs_df["regime"] = obs_df["state"].map(REGIME_LABELS)
@@ -369,14 +367,14 @@ with tab_obs:
         rows=2, cols=1,
         shared_xaxes=True,
         vertical_spacing=0.08,
-        subplot_titles=("Precipitation (mm/day)", "Evapotranspiration (mm/month)"),
+        subplot_titles=("Precip anomaly (mm/mo)", "ET anomaly (mm/mo)"),
     )
 
     for k in range(4):
         mask = obs_df["state"] == k
         # precip
         fig3.add_trace(go.Scatter(
-            x=obs_df.index[mask], y=obs_df.loc[mask, "precip_mm"],
+            x=obs_df.index[mask], y=obs_df.loc[mask, "precip_anom"],
             mode="markers",
             name=REGIME_LABELS[k],
             legendgroup=str(k),
@@ -386,7 +384,7 @@ with tab_obs:
         ), row=1, col=1)
         # ET
         fig3.add_trace(go.Scatter(
-            x=obs_df.index[mask], y=obs_df.loc[mask, "et_mm"],
+            x=obs_df.index[mask], y=obs_df.loc[mask, "et_anom"],
             mode="markers",
             name=REGIME_LABELS[k],
             legendgroup=str(k),
@@ -415,8 +413,8 @@ with tab_obs:
     for k in range(4):
         mask = obs_df["state"] == k
         fig4.add_trace(go.Scatter(
-            x=obs_df.loc[mask, "precip_mm"],
-            y=obs_df.loc[mask, "et_mm"],
+            x=obs_df.loc[mask, "precip_anom"],
+            y=obs_df.loc[mask, "et_anom"],
             mode="markers",
             name=REGIME_LABELS[k],
             marker=dict(color=REGIME_COLORS[k], size=3, opacity=0.4),
@@ -447,8 +445,8 @@ with tab_obs:
     fig4.update_layout(
         **PLOTLY_LAYOUT,
         height=420,
-        xaxis=dict(title="Precipitation (mm/day)", showgrid=True, gridcolor="#f0f0f0"),
-        yaxis=dict(title="ET (mm/month)", showgrid=True, gridcolor="#f0f0f0"),
+        xaxis=dict(title="Precip anomaly (mm/mo)", showgrid=True, gridcolor="#f0f0f0"),
+        yaxis=dict(title="ET anomaly (mm/mo)", showgrid=True, gridcolor="#f0f0f0"),
         legend=dict(
             orientation="h", yanchor="bottom", y=1.02,
             xanchor="left", x=0, itemsizing="constant",
@@ -500,8 +498,8 @@ with tab_params:
         for k in range(4):
             rows.append({
                 "Regime": REGIME_LABELS[k],
-                "Precip μ (mm/day)": f"{mus_phys[k,0]:.2f}",
-                "ET μ (mm/month)": f"{mus_phys[k,1]:.1f}",
+                "Precip μ anom (mm/mo)": f"{mus_phys[k,0]:.1f}",
+                "ET μ anom (mm/mo)": f"{mus_phys[k,1]:.1f}",
                 "Precip σ": f"{np.sqrt(sigmas[k,0,0]) * obs_std[0]:.3f}",
                 "ET σ": f"{np.sqrt(sigmas[k,1,1]) * obs_std[1]:.2f}",
             })

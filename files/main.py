@@ -82,18 +82,11 @@ def main():
         print(f"Loading NetCDF: precip={args.precip}, ET={args.et}")
         X, dates = load_netcdf(args.precip, args.et)
 
-    print(f"Data shape: {X.shape}  (T={X.shape[0]} days, D={X.shape[1]} features)")
-    print(f"Precip range: {X[:,0].min():.2f} – {X[:,0].max():.2f} mm/day")
-    print(f"ET range:     {X[:,1].min():.2f} – {X[:,1].max():.2f} mm/day")
+    print(f"Data shape: {X.shape}  (T={X.shape[0]} months, D={X.shape[1]} features)")
+    print(f"Precip anomaly range: {X[:,0].min():.1f} – {X[:,0].max():.1f} mm")
+    print(f"ET anomaly range:     {X[:,1].min():.1f} – {X[:,1].max():.1f} mm")
 
-    # Log1p-transform precip: distribution is heavily right-skewed (mostly 0,
-    # rare large events). Without this, normalized precip is near-zero on ~80%
-    # of days and the HMM separates almost purely on the smooth ET seasonal
-    # signal, producing unrealistically long sticky runs.
-    X[:, 0] = np.log1p(X[:, 0])
-    print(f"Precip after log1p: range {X[:,0].min():.2f} – {X[:,0].max():.2f}")
-
-    # Normalize
+    # Normalize anomalies to zero mean / unit variance
     X_norm, mean, std = normalize(X)
     print(f"Observation mean: {mean}, std: {std}")
 
@@ -107,7 +100,7 @@ def main():
     print("\n=== Emission means (original scale) ===")
     for k in range(args.K):
         mu_orig = model.mus[k] * std + mean
-        print(f"  State {k}: precip={mu_orig[0]:.2f} mm/day, ET={mu_orig[1]:.2f} mm/day")
+        print(f"  State {k}: precip_anom={mu_orig[0]:.1f} mm/mo, ET_anom={mu_orig[1]:.1f} mm/mo")
 
     # --- Decode ---
     states, log_prob = model.decode(X_norm)

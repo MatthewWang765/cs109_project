@@ -23,51 +23,52 @@ import xarray as xr
 
 def load_netcdf(precip_path, et_path):
     """
-    Load daily SJV observations from the NetCDF files.
+    Load monthly SJV observations as anomalies from the seasonal climatology.
 
-    GPM precip is daily; OpenET is monthly. ET is forward-filled to daily.
-    Uses the pre-computed spatial-mean variables to avoid resolution mismatch.
+    Working at monthly resolution (252 months, 2000-01 to 2020-12) removes the
+    problem of fitting a seasonal sine wave: the model sees departures from the
+    long-term monthly mean, so it can distinguish drought years from wet years
+    rather than just "summer vs winter".
+
+    Features returned:
+      precip_anom  — monthly precip total minus that calendar-month's 21-yr mean (mm)
+      et_anom      — monthly ET minus that calendar-month's 21-yr mean (mm)
 
     Returns
     -------
-    X     : (T, 2) float array [precip_mean mm/day, et_mean mm/day]
-    dates : pandas DatetimeIndex (daily, 2000-01-01 to 2020-12-31)
+    X     : (252, 2) float array
+    dates : pandas DatetimeIndex (monthly, period start)
     """
-    gpm = xr.open_dataset(precip_path)
+    gpm   = xr.open_dataset(precip_path)
     et_ds = xr.open_dataset(et_path)
 
-    # Daily precip mean (mm/day), already SJV-averaged
-    precip = gpm["precip_mean"].to_series().rename("precip_mm")
-    precip.index = pd.DatetimeIndex(precip.index).normalize()
+    # ── GPM: aggregate daily precip to monthly totals ──────────────────────
+    precip_daily = gpm["precip_mean"].to_series()
+    precip_daily.index = pd.DatetimeIndex(precip_daily.index).normalize()
+    precip_monthly = (
+        precip_daily
+        .resample("MS")           # month-start
+        .sum()
+        .rename("precip_mm")
+    )
 
-    # Monthly ET mean (mm/month) → linearly interpolate to daily
-    # Anchor each monthly value at the 15th (mid-month) so interpolation is
-    # centred rather than stepped, avoiding artificial jumps on the 1st.
+    # ── OpenET: already monthly, align index to month-start ────────────────
     et_monthly = et_ds["et_mean"].to_series().rename("et_mm")
     et_monthly.index = (
-        pd.DatetimeIndex(et_monthly.index).to_period("M").to_timestamp("M")
-        - pd.offsets.MonthBegin(1)
-        + pd.Timedelta(days=14)          # shift to mid-month
+        pd.DatetimeIndex(et_monthly.index)
+        .to_period("M").to_timestamp("M") - pd.offsets.MonthBegin(1)
     )
 
-    # Merge onto daily grid and interpolate between mid-month anchors;
-    # back-fill the leading edge (days before the first mid-month anchor)
-    # and forward-fill the trailing edge so no days are dropped.
-    daily_index = precip.index
-    et_on_daily = et_monthly.reindex(daily_index.union(et_monthly.index))
-    et_daily = (
-        et_on_daily
-        .interpolate(method="time")
-        .bfill()    # fills days before Jan 15 2000
-        .ffill()    # fills any trailing days after last anchor
-        .reindex(daily_index)
-    )
+    df = pd.DataFrame({"precip_mm": precip_monthly, "et_mm": et_monthly})
+    df = df[(df.index.year >= 2000) & (df.index.year <= 2020)].dropna()
 
-    df = pd.DataFrame({"precip_mm": precip, "et_mm": et_daily})
-    df = df[(df.index.year >= 2000) & (df.index.year <= 2020)]
-    df = df.dropna()
+    # ── Remove seasonal climatology → anomalies ─────────────────────────────
+    # Climatological mean for each calendar month (Jan=1 … Dec=12)
+    clim = df.groupby(df.index.month).mean()          # shape (12, 2)
+    df["precip_anom"] = df["precip_mm"] - df.index.map(lambda d: clim.loc[d.month, "precip_mm"])
+    df["et_anom"]     = df["et_mm"]     - df.index.map(lambda d: clim.loc[d.month, "et_mm"])
 
-    X = df[["precip_mm", "et_mm"]].values.astype(float)
+    X     = df[["precip_anom", "et_anom"]].values.astype(float)
     dates = df.index
     return X, dates
 
