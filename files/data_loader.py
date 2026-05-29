@@ -62,27 +62,29 @@ def load_netcdf(precip_path, et_path):
     df = pd.DataFrame({"precip_mm": precip_monthly, "et_mm": et_monthly})
     df = df[(df.index.year >= 2000) & (df.index.year <= 2020)].dropna()
 
-    # ── Standardised anomalies (z-score by calendar month) ──────────────────
-    # Subtracting the mean alone doesn't help: summer precip in the SJV is
-    # always ~0 mm, so the raw anomaly is always ~0 regardless of drought.
-    # Dividing by each month's std puts all months on the same scale — a
-    # "−2σ July" and a "−2σ January" both signal anomalous dryness.
-    # A std floor of 5 mm (precip) / 1 mm (ET) avoids division near zero
-    # for months where the signal is nearly constant.
-    clim_mean = df.groupby(df.index.month).mean()
-    clim_std  = df.groupby(df.index.month).std()
-    clim_std["precip_mm"] = clim_std["precip_mm"].clip(lower=5.0)
-    clim_std["et_mm"]     = clim_std["et_mm"].clip(lower=1.0)
+    # ── 3-month rolling sums → standardised anomalies (SPI/SPEI style) ─────
+    # Monthly anomalies are noisy and the HMM with K=4 latches onto seasonal
+    # variance structure rather than drought episodes. A 3-month rolling
+    # window smooths month-to-month noise and isolates the multi-month
+    # drought signal that's climatologically meaningful.
+    # Then z-score by calendar month (no std floor — the true per-month std
+    # is computed from 21 years of data, which is enough).
+    df["precip_3mo"] = df["precip_mm"].rolling(3, min_periods=1).sum()
+    df["et_3mo"]     = df["et_mm"].rolling(3, min_periods=1).sum()
+
+    clim_mean = df[["precip_3mo", "et_3mo"]].groupby(df.index.month).mean()
+    clim_std  = df[["precip_3mo", "et_3mo"]].groupby(df.index.month).std()
 
     months = df.index.month
     df["precip_anom"] = (
-        (df["precip_mm"].values - clim_mean.loc[months, "precip_mm"].values)
-        / clim_std.loc[months, "precip_mm"].values
+        (df["precip_3mo"].values - clim_mean.loc[months, "precip_3mo"].values)
+        / clim_std.loc[months, "precip_3mo"].values
     )
     df["et_anom"] = (
-        (df["et_mm"].values - clim_mean.loc[months, "et_mm"].values)
-        / clim_std.loc[months, "et_mm"].values
+        (df["et_3mo"].values - clim_mean.loc[months, "et_3mo"].values)
+        / clim_std.loc[months, "et_3mo"].values
     )
+    df = df.dropna(subset=["precip_anom", "et_anom"])
 
     X     = df[["precip_anom", "et_anom"]].values.astype(float)
     dates = df.index

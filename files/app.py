@@ -36,17 +36,17 @@ st.set_page_config(
 # ── design tokens ─────────────────────────────────────────────────────────────
 # Earthy, drought-appropriate palette — one color per regime
 REGIME_COLORS = {
-    0: "#7A8C7E",   # sage-grey  → cool-dry (suppressed precip + ET)
-    1: "#5B8DB8",   # steel-blue → wet (precip surplus)
-    2: "#D4A843",   # gold       → warm-wet (precip + ET both above normal)
-    3: "#B94040",   # brick-red  → hot drought (precip deficit + high ET demand)
+    0: "#5B8DB8",   # steel-blue → wet (precip surplus)
+    1: "#7A8C7E",   # sage-grey  → near-normal
+    2: "#B94040",   # brick-red  → hot drought (precip deficit + high ET)
+    3: "#D97B4F",   # amber      → cool drought (precip deficit + suppressed ET)
 }
 
 REGIME_LABELS = {
-    0: "Cool-Dry",
-    1: "Wet",
-    2: "Warm-Wet",
-    3: "Hot Drought",
+    0: "Wet",
+    1: "Near-Normal",
+    2: "Hot Drought",
+    3: "Cool Drought",
 }
 
 PLOTLY_LAYOUT = dict(
