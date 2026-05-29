@@ -252,7 +252,32 @@ tab_timeline, tab_obs, tab_params, tab_duration, tab_convergence = st.tabs([
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_timeline:
     st.markdown("### Decoded Drought Regimes — Daily, 2000–2020")
-    st.caption("Coloured ribbon showing Viterbi-decoded hidden state. Drag to zoom, double-click to reset.")
+
+    smooth_days = st.slider(
+        "Smoothing window (days) — majority vote, display only",
+        min_value=1, max_value=30, value=14, step=1,
+        help="Suppresses isolated 1–3 day state flips. Does not change the model.",
+    )
+
+    @st.cache_data(show_spinner=False)
+    def smooth_states(s_arr, window):
+        """Rolling majority vote over a centred window."""
+        if window <= 1:
+            return s_arr
+        half = window // 2
+        out = s_arr.copy()
+        for i in range(len(s_arr)):
+            lo, hi = max(0, i - half), min(len(s_arr), i + half + 1)
+            vals, counts = np.unique(s_arr[lo:hi], return_counts=True)
+            out[i] = vals[np.argmax(counts)]
+        return out
+
+    display_states = smooth_states(states, smooth_days)
+    display_df = obs_df.copy()
+    display_df["state"] = display_states
+    display_df["regime"] = display_df["state"].map(REGIME_LABELS)
+
+    st.caption("Coloured ribbon — each row shows when that regime was active. Drag to zoom, double-click to reset.")
 
     # ── Build run-length encoded segments for px.timeline (Gantt ribbon) ──
     def rle_segments(df):
@@ -270,7 +295,7 @@ with tab_timeline:
         segs["dur"] = (segs["end"] - segs["start"]).dt.days
         return segs
 
-    segs = rle_segments(obs_df)
+    segs = rle_segments(display_df)
 
     color_map = {REGIME_LABELS[k]: REGIME_COLORS[k] for k in range(4)}
     # Row order: arrange regimes from wettest to driest top-to-bottom
