@@ -268,36 +268,35 @@ with tab_timeline:
         segs = pd.DataFrame(rows)
         segs["regime"] = segs["state"].map(REGIME_LABELS)
         segs["dur"] = (segs["end"] - segs["start"]).dt.days
-        segs["row"] = "Regime"
         return segs
 
     segs = rle_segments(obs_df)
 
     color_map = {REGIME_LABELS[k]: REGIME_COLORS[k] for k in range(4)}
-    # Keep legend order consistent
-    cat_order = {"regime": [REGIME_LABELS[k] for k in range(4)]}
+    # Row order: arrange regimes from wettest to driest top-to-bottom
+    row_order = [REGIME_LABELS[k] for k in range(4)]
 
     fig = px.timeline(
         segs,
-        x_start="start", x_end="end", y="row",
+        x_start="start", x_end="end",
+        y="regime",          # each regime on its own row
         color="regime",
         color_discrete_map=color_map,
-        category_orders=cat_order,
-        hover_data={"start": "|%b %d, %Y", "end": "|%b %d, %Y", "dur": True,
-                    "row": False, "regime": False},
+        category_orders={"regime": row_order},
+        hover_data={"start": "|%b %d, %Y", "end": "|%b %d, %Y",
+                    "dur": True, "regime": False},
         labels={"dur": "days", "start": "Start", "end": "End"},
     )
     fig.update_layout(
-        **{**PLOTLY_LAYOUT, "margin": dict(l=16, r=16, t=40, b=16)},
-        height=130,
-        xaxis=dict(showgrid=False, title=None, rangeslider=dict(visible=True, thickness=0.15)),
-        yaxis=dict(visible=False),
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.1,
-            xanchor="left", x=0, itemsizing="constant",
-            title=None,
-        ),
+        **{**PLOTLY_LAYOUT, "margin": dict(l=16, r=16, t=16, b=16)},
+        height=220,
+        xaxis=dict(showgrid=False, title=None,
+                   rangeslider=dict(visible=True, thickness=0.12)),
+        yaxis=dict(title=None, showgrid=False, tickfont=dict(size=12)),
+        showlegend=False,
     )
+    # Make bars tall enough to look like solid bands
+    fig.update_traces(marker_line_width=0)
     st.plotly_chart(fig, use_container_width=True)
 
     # ── annual regime composition bar chart ──────────────────────────────────
