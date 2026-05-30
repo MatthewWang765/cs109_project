@@ -92,6 +92,107 @@ def load_netcdf(precip_path, et_path):
     return X, dates
 
 
+def load_spatial_percentile(precip_path, window=12):
+    """
+    Compute percentile-rank drought severity per GPM grid cell, per month.
+
+    For each cell, take the 12-month rolling precip total, then rank each
+    month against all other Januaries (or Februaries…) in the 21-year record.
+    The output is a percentile in [0, 1] where 0 = driest such month on
+    record and 1 = wettest.
+
+    This is the same approach the U.S. Drought Monitor uses to assign
+    categories, and is distribution-free — it doesn't depend on a Gaussian
+    assumption or get deflated when the baseline includes the drought itself.
+
+    USDM category mapping (driest p% on record):
+      p < 0.02:  D4 Exceptional Drought
+      p < 0.05:  D3 Extreme
+      p < 0.10:  D2 Severe
+      p < 0.20:  D1 Moderate
+      p < 0.30:  D0 Abnormally Dry
+      0.30–0.70: Normal
+      p > 0.70:  Wet → Exceptionally Wet
+
+    Returns
+    -------
+    lat   : (Nlat,) latitudes
+    lon   : (Nlon,) longitudes
+    dates : (T,) pandas DatetimeIndex
+    pct   : (T, Nlat, Nlon) float32  percentile in [0, 1]
+    """
+    gpm = xr.open_dataset(precip_path)
+    precip = gpm["precipitation"]
+
+    monthly = precip.resample(time="MS").sum()
+    rolling = monthly.rolling(time=window, min_periods=window).sum()
+
+    # Drop the leading NaN window
+    rolling = rolling.dropna("time", how="all")
+    arr  = rolling.values                    # (T, lat, lon)
+    dts  = pd.DatetimeIndex(rolling["time"].values)
+    months = dts.month.values
+
+    # For each calendar month, rank cells across years
+    pct = np.full_like(arr, np.nan, dtype="float32")
+    for m in range(1, 13):
+        mask = months == m
+        if mask.sum() < 2:
+            continue
+        sub = arr[mask]                      # (Nyears, lat, lon)
+        # argsort twice → ranks 0..Nyears-1 along axis 0
+        ranks = sub.argsort(axis=0).argsort(axis=0)
+        # convert to percentile in (0, 1) using (rank + 0.5) / N  (midpoint)
+        pct[mask] = (ranks + 0.5) / sub.shape[0]
+
+    return rolling["lat"].values, rolling["lon"].values, dts, pct
+
+
+def load_spatial_spi(precip_path, window=12):
+    """
+    Compute SPI-`window` (z-scored 12-month rolling precipitation anomaly)
+    at every GPM grid cell over the SJV.
+
+    Returns
+    -------
+    lat   : (Nlat,) array of latitudes (cell centres, south→north)
+    lon   : (Nlon,) array of longitudes (cell centres, west→east)
+    dates : (T,) pandas DatetimeIndex of valid month-starts
+    spi   : (T, Nlat, Nlon) float32 array — SPI z-score per cell per month
+    """
+    gpm = xr.open_dataset(precip_path)
+    precip = gpm["precipitation"]           # (time, lat, lon), daily mm
+
+    # Aggregate daily → monthly totals per cell
+    monthly = precip.resample(time="MS").sum()
+    # 12-month rolling sum at each cell
+    rolling = monthly.rolling(time=window, min_periods=window).sum()
+
+    # Per-cell climatology (mean and std by calendar month) — vectorised
+    by_month = rolling.groupby("time.month")
+    clim_mean = by_month.mean("time")        # (12, lat, lon)
+    clim_std  = by_month.std("time")         # (12, lat, lon)
+
+    # Avoid division by zero for cells with degenerate climatology
+    clim_std_safe = clim_std.where(clim_std > 1.0, 1.0)
+
+    months = rolling["time"].dt.month
+    mean_t = clim_mean.sel(month=months)
+    std_t  = clim_std_safe.sel(month=months)
+    spi = ((rolling - mean_t) / std_t).astype("float32")
+
+    # Drop the leading NaN window
+    valid = ~spi.isnull().all(dim=("lat", "lon"))
+    spi   = spi.where(valid, drop=True)
+
+    return (
+        spi["lat"].values,
+        spi["lon"].values,
+        pd.DatetimeIndex(spi["time"].values),
+        spi.values,
+    )
+
+
 def load_csv(path):
     """
     Load daily SJV observations from a CSV file.
