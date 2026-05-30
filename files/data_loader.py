@@ -124,26 +124,32 @@ def load_spatial_percentile(precip_path, window=12):
     gpm = xr.open_dataset(precip_path)
     precip = gpm["precipitation"]
 
+    # The source data has NaN cells outside the SJV — those should stay NaN
+    # through the percentile calculation so downstream code can render them
+    # as background (white) and draw an outline only around real SJV cells.
+    sjv_mask = ~np.all(np.isnan(precip.values), axis=0)         # (lat, lon)
+
     monthly = precip.resample(time="MS").sum()
     rolling = monthly.rolling(time=window, min_periods=window).sum()
-
-    # Drop the leading NaN window
     rolling = rolling.dropna("time", how="all")
-    arr  = rolling.values                    # (T, lat, lon)
+
+    arr  = rolling.values.copy()             # (T, lat, lon)
+    arr[:, ~sjv_mask] = np.nan               # restore SJV mask after the resample
     dts  = pd.DatetimeIndex(rolling["time"].values)
     months = dts.month.values
 
-    # For each calendar month, rank cells across years
     pct = np.full_like(arr, np.nan, dtype="float32")
+    sjv_cells = np.argwhere(sjv_mask)
     for m in range(1, 13):
-        mask = months == m
-        if mask.sum() < 2:
+        idx_m = np.where(months == m)[0]
+        if len(idx_m) < 2:
             continue
-        sub = arr[mask]                      # (Nyears, lat, lon)
-        # argsort twice → ranks 0..Nyears-1 along axis 0
-        ranks = sub.argsort(axis=0).argsort(axis=0)
-        # convert to percentile in (0, 1) using (rank + 0.5) / N  (midpoint)
-        pct[mask] = (ranks + 0.5) / sub.shape[0]
+        sub = arr[idx_m]
+        Nyears = sub.shape[0]
+        for i, j in sjv_cells:
+            vals = sub[:, i, j]
+            ranks = vals.argsort().argsort()
+            pct[idx_m, i, j] = (ranks + 0.5) / Nyears
 
     return rolling["lat"].values, rolling["lon"].values, dts, pct
 

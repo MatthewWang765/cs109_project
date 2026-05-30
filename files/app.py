@@ -113,7 +113,7 @@ def load_outputs():
 
 
 @st.cache_data(show_spinner="Computing per-cell drought percentiles…")
-def load_spatial():
+def load_spatial(_v=2):     # bump _v to invalidate cache after loader changes
     """Returns (lat, lon, dates, pct) — drought percentile per cell per month."""
     from data_loader import load_spatial_percentile
     return load_spatial_percentile("data/gpm_sjv_subset.nc", window=12)
@@ -341,6 +341,38 @@ with tab_map:
     max_dt = sp_dates[-1].to_pydatetime().date()
     month_labels = [d.strftime("%b %Y") for d in sp_dates]
 
+    # ── Precompute SJV outline ONCE — same mask every month ──────────────────
+    # Emits any cell edge that borders a NaN neighbour. A single Scatter
+    # polyline overlay draws them all on top of the heatmap → one black
+    # outline around the perimeter of the SJV (no per-pixel grid).
+    @st.cache_data(show_spinner=False)
+    def _sjv_outline(lat_arr, lon_arr, mask_bytes):
+        mask = np.frombuffer(mask_bytes, dtype=bool).reshape(len(lat_arr), len(lon_arr))
+        Nlat, Nlon = mask.shape
+        dh = float(lat_arr[1] - lat_arr[0]) if Nlat > 1 else 0.1
+        dw = float(lon_arr[1] - lon_arr[0]) if Nlon > 1 else 0.1
+        xs, ys = [], []
+        for i in range(Nlat):
+            for j in range(Nlon):
+                if not mask[i, j]:
+                    continue
+                yt = float(lat_arr[i]) + dh / 2
+                yb = float(lat_arr[i]) - dh / 2
+                xl = float(lon_arr[j]) - dw / 2
+                xr = float(lon_arr[j]) + dw / 2
+                if i + 1 >= Nlat or not mask[i + 1, j]:
+                    xs += [xl, xr, None]; ys += [yt, yt, None]
+                if i - 1 < 0 or not mask[i - 1, j]:
+                    xs += [xl, xr, None]; ys += [yb, yb, None]
+                if j - 1 < 0 or not mask[i, j - 1]:
+                    xs += [xl, xl, None]; ys += [yb, yt, None]
+                if j + 1 >= Nlon or not mask[i, j + 1]:
+                    xs += [xr, xr, None]; ys += [yb, yt, None]
+        return xs, ys
+
+    _sjv_mask = (~np.isnan(sp_grid[0])).astype(bool)
+    outline_x, outline_y = _sjv_outline(sp_lat, sp_lon, _sjv_mask.tobytes())
+
     # ── Single source of truth for the displayed month ───────────────────────
     if "map_idx" not in st.session_state:
         st.session_state["map_idx"] = len(sp_dates) - 1
@@ -368,9 +400,10 @@ with tab_map:
         help="Pick any date — the map snaps to the nearest available SPI-12 month.",
     )
 
-    # ── Static heatmap for the current month ─────────────────────────────────
+    # ── Static heatmap for the current month + SJV outline overlay ──────────
     idx = st.session_state["map_idx"]
-    fig_map = go.Figure(go.Heatmap(
+    fig_map = go.Figure()
+    fig_map.add_trace(go.Heatmap(
         z=sp_grid[idx], x=sp_lon, y=sp_lat,
         zmin=0, zmax=1, colorscale=colorscale,
         colorbar=dict(
@@ -388,6 +421,12 @@ with tab_map:
             "Percentile rank: %{z:.0%}<br>"
             "<b>%{customdata}</b><extra></extra>"
         ),
+    ))
+    fig_map.add_trace(go.Scatter(
+        x=outline_x, y=outline_y,
+        mode="lines",
+        line=dict(color="black", width=1.4),
+        hoverinfo="skip", showlegend=False,
     ))
     fig_map.update_layout(
         **{**PLOTLY_LAYOUT, "margin": dict(l=60, r=24, t=80, b=60)},
