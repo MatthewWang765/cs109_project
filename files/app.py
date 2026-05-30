@@ -13,6 +13,7 @@ Run with:  streamlit run app.py
 
 import sys
 import os
+import time
 sys.path.insert(0, os.path.dirname(__file__))
 
 import numpy as np
@@ -336,145 +337,105 @@ with tab_map:
     cat_grid[np.isnan(sp_grid)] = "—"
 
     AXIS_DARK = "#222"
-
-    # ── Date picker / search (calendar) ──────────────────────────────────────
     min_dt = sp_dates[0].to_pydatetime().date()
     max_dt = sp_dates[-1].to_pydatetime().date()
-    chosen = st.date_input(
+    month_labels = [d.strftime("%b %Y") for d in sp_dates]
+
+    # ── Single source of truth for the displayed month ───────────────────────
+    if "map_idx" not in st.session_state:
+        st.session_state["map_idx"] = len(sp_dates) - 1
+    if "map_playing" not in st.session_state:
+        st.session_state["map_playing"] = False
+
+    # If something queued a new index since last run, apply it BEFORE the
+    # slider widget is created so the widget picks it up as its current value.
+    if "_map_target" in st.session_state:
+        st.session_state["map_idx"] = st.session_state.pop("_map_target")
+
+    # ── Date picker (jumps to nearest month, stops animation) ────────────────
+    def _on_date_change():
+        d = st.session_state["_date_jump"]
+        ts = pd.Timestamp(d)
+        diffs = np.array([abs((sp_dates[i] - ts).total_seconds()) for i in range(T)])
+        st.session_state["_map_target"] = int(np.argmin(diffs))
+        st.session_state["map_playing"] = False
+
+    st.date_input(
         "🔍 Jump to date",
-        value=max_dt,
-        min_value=min_dt,
-        max_value=max_dt,
-        help=(
-            "Pick any date between Dec 2000 and Dec 2020. The map will show the "
-            "12-month SPI window ending at the nearest available month."
-        ),
-    )
-    chosen_ts = pd.Timestamp(chosen).normalize()
-    initial_idx = int(np.argmin(np.abs(sp_dates - chosen_ts).total_seconds()))
-
-    # ── Heatmap factory ──────────────────────────────────────────────────────
-    def make_heatmap(z, customdata):
-        return go.Heatmap(
-            z=z, x=sp_lon, y=sp_lat,
-            zmin=0, zmax=1,
-            colorscale=colorscale,
-            colorbar=dict(
-                tickmode="array",
-                tickvals=[0.025, 0.075, 0.125, 0.195, 0.285, 0.50,
-                          0.715, 0.785, 0.835, 0.905, 0.975],
-                ticktext=["D4", "D3", "D2", "D1", "D0", "Normal",
-                          "W0", "W1", "W2", "W3", "W4"],
-                tickfont=dict(color=AXIS_DARK, size=11),
-                len=0.92, thickness=18, outlinewidth=0,
-            ),
-            customdata=customdata,
-            hovertemplate=(
-                "lat %{y:.2f}°  lon %{x:.2f}°<br>"
-                "Percentile rank: %{z:.0%}<br>"
-                "<b>%{customdata}</b><extra></extra>"
-            ),
-        )
-
-    # ── Animation frames — title updates per frame ───────────────────────────
-    def frame_layout(i):
-        return go.Layout(
-            title=dict(
-                text=f"<b>{sp_dates[i].strftime('%B %Y')}</b>",
-                x=0.5, xanchor="center", y=0.97,
-                font=dict(size=22, color=AXIS_DARK),
-            ),
-            paper_bgcolor="white",
-            plot_bgcolor="white",
-        )
-
-    frames = [
-        go.Frame(
-            data=[make_heatmap(sp_grid[i], cat_grid[i])],
-            name=str(i),
-            layout=frame_layout(i),
-        )
-        for i in range(T)
-    ]
-
-    slider_steps = [
-        dict(
-            method="animate",
-            args=[
-                [str(i)],
-                {"mode": "immediate",
-                 "frame": {"duration": 0, "redraw": True},
-                 "transition": {"duration": 0}},
-            ],
-            label=sp_dates[i].strftime("%Y") if sp_dates[i].month == 1 else "",
-        )
-        for i in range(T)
-    ]
-
-    fig_map = go.Figure(
-        data=[make_heatmap(sp_grid[initial_idx], cat_grid[initial_idx])],
-        frames=frames,
-        layout=go.Layout(
-            **{**PLOTLY_LAYOUT,
-               "margin": dict(l=60, r=24, t=80, b=220),
-               "font":   dict(color=AXIS_DARK, family="Inter, system-ui, sans-serif")},
-            title=dict(
-                text=f"<b>{sp_dates[initial_idx].strftime('%B %Y')}</b>",
-                x=0.5, xanchor="center", y=0.97,
-                font=dict(size=22, color=AXIS_DARK),
-            ),
-            height=720,
-            xaxis=dict(
-                title=dict(text="Longitude (°W)",
-                           font=dict(color=AXIS_DARK, size=13), standoff=20),
-                showgrid=False, showline=True, linecolor=AXIS_DARK, linewidth=1,
-                tickfont=dict(color=AXIS_DARK, size=11), ticks="outside",
-                tickcolor=AXIS_DARK,
-                scaleanchor="y", scaleratio=1.0, tickformat=".1f", zeroline=False,
-            ),
-            yaxis=dict(
-                title=dict(text="Latitude (°N)", font=dict(color=AXIS_DARK, size=13)),
-                showgrid=False, showline=True, linecolor=AXIS_DARK, linewidth=1,
-                tickfont=dict(color=AXIS_DARK, size=11), ticks="outside",
-                tickcolor=AXIS_DARK,
-                tickformat=".1f", zeroline=False,
-            ),
-            updatemenus=[dict(
-                type="buttons", direction="left",
-                x=0.02, y=-0.20, xanchor="left", yanchor="top",
-                pad=dict(t=0, r=10),
-                showactive=False,
-                bgcolor="white",
-                bordercolor=AXIS_DARK, borderwidth=1,
-                font=dict(color=AXIS_DARK, size=12),
-                buttons=[
-                    dict(label="▶ Play", method="animate",
-                         args=[None, {"frame": {"duration": 160, "redraw": True},
-                                      "fromcurrent": True,
-                                      "transition": {"duration": 0}}]),
-                    dict(label="❚❚ Pause", method="animate",
-                         args=[[None], {"frame": {"duration": 0, "redraw": False},
-                                        "mode": "immediate",
-                                        "transition": {"duration": 0}}]),
-                ],
-            )],
-            sliders=[dict(
-                active=initial_idx,
-                currentvalue=dict(visible=False),
-                pad=dict(t=40, b=12, l=10, r=10),
-                x=0.10, len=0.88, y=-0.18,
-                ticklen=4,
-                minorticklen=0,
-                tickcolor=AXIS_DARK,
-                font=dict(color=AXIS_DARK, size=11),
-                bgcolor="#f5f5f5",
-                bordercolor="#d0d0d0",
-                steps=slider_steps,
-            )],
-        ),
+        value=sp_dates[st.session_state["map_idx"]].to_pydatetime().date(),
+        min_value=min_dt, max_value=max_dt,
+        key="_date_jump", on_change=_on_date_change,
+        help="Pick any date — the map snaps to the nearest available SPI-12 month.",
     )
 
-    st.plotly_chart(fig_map, use_container_width=True, theme=None)
+    # ── Static heatmap for the current month ─────────────────────────────────
+    idx = st.session_state["map_idx"]
+    fig_map = go.Figure(go.Heatmap(
+        z=sp_grid[idx], x=sp_lon, y=sp_lat,
+        zmin=0, zmax=1, colorscale=colorscale,
+        colorbar=dict(
+            tickmode="array",
+            tickvals=[0.025, 0.075, 0.125, 0.195, 0.285, 0.50,
+                      0.715, 0.785, 0.835, 0.905, 0.975],
+            ticktext=["D4", "D3", "D2", "D1", "D0", "Normal",
+                      "W0", "W1", "W2", "W3", "W4"],
+            tickfont=dict(color=AXIS_DARK, size=11),
+            len=0.92, thickness=18, outlinewidth=0,
+        ),
+        customdata=cat_grid[idx],
+        hovertemplate=(
+            "lat %{y:.2f}°  lon %{x:.2f}°<br>"
+            "Percentile rank: %{z:.0%}<br>"
+            "<b>%{customdata}</b><extra></extra>"
+        ),
+    ))
+    fig_map.update_layout(
+        **{**PLOTLY_LAYOUT, "margin": dict(l=60, r=24, t=80, b=60)},
+        height=580,
+        title=dict(
+            text=f"<b>{sp_dates[idx].strftime('%B %Y')}</b>",
+            x=0.5, xanchor="center", y=0.97,
+            font=dict(size=22, color=AXIS_DARK),
+        ),
+        xaxis=dict(
+            title=dict(text="Longitude (°W)",
+                       font=dict(color=AXIS_DARK, size=13), standoff=20),
+            showgrid=False, showline=True, linecolor=AXIS_DARK, linewidth=1,
+            tickfont=dict(color=AXIS_DARK, size=11), ticks="outside",
+            tickcolor=AXIS_DARK,
+            scaleanchor="y", scaleratio=1.0, tickformat=".1f", zeroline=False,
+        ),
+        yaxis=dict(
+            title=dict(text="Latitude (°N)", font=dict(color=AXIS_DARK, size=13)),
+            showgrid=False, showline=True, linecolor=AXIS_DARK, linewidth=1,
+            tickfont=dict(color=AXIS_DARK, size=11), ticks="outside",
+            tickcolor=AXIS_DARK,
+            tickformat=".1f", zeroline=False,
+        ),
+    )
+    # `displayModeBar: False` hides Plotly's modebar — no fullscreen button,
+    # no broken state to enter.
+    st.plotly_chart(fig_map, use_container_width=True, theme=None,
+                    config={"displayModeBar": False})
+
+    # ── Streamlit slider + Play/Pause (live drag, single-click, always works)
+    st.select_slider(
+        "Month",
+        options=list(range(T)),
+        format_func=lambda i: month_labels[i],
+        key="map_idx",
+    )
+
+    def _on_play():  st.session_state["map_playing"] = True
+    def _on_pause(): st.session_state["map_playing"] = False
+
+    bc1, bc2, _ = st.columns([1, 1, 6])
+    bc1.button("▶ Play",   on_click=_on_play,
+               disabled=st.session_state["map_playing"],
+               use_container_width=True)
+    bc2.button("❚❚ Pause", on_click=_on_pause,
+               disabled=not st.session_state["map_playing"],
+               use_container_width=True)
 
     # ── Time-series stack: % of SJV in each USDM category over time ──────────
     st.markdown("#### % of SJV in each USDM category, over time")
@@ -511,6 +472,17 @@ with tab_map:
                     font=dict(size=10)),
     )
     st.plotly_chart(fig_ts, use_container_width=True, theme=None)
+
+    # ── Auto-advance when playing ────────────────────────────────────────────
+    # Streamlit-driven: write to _map_target, rerun. Next run applies it to
+    # the slider before any widget renders, so map_idx advances cleanly.
+    if st.session_state["map_playing"]:
+        if st.session_state["map_idx"] < T - 1:
+            time.sleep(0.15)
+            st.session_state["_map_target"] = st.session_state["map_idx"] + 1
+            st.rerun()
+        else:
+            st.session_state["map_playing"] = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
