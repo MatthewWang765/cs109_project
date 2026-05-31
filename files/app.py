@@ -81,6 +81,9 @@ st.markdown("""
   [data-testid="stMetricLabel"] { font-size: 0.75rem; color: #666; }
   /* section headers */
   h3 { font-weight: 600; letter-spacing: -0.02em; margin-top: 0; }
+  /* hide the top-right "Running…" status widget (sport-icon animation +
+     stop button) so the animation loop doesn't trigger it every frame. */
+  [data-testid="stStatusWidget"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -206,32 +209,29 @@ outputs_exist = (
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## San Joaquin Valley\nDrought Regime HMM")
-    st.divider()
-
-    st.markdown("**Model**")
-    st.markdown("4-state Gaussian HMM  \nBaum-Welch (EM), from scratch  \nViterbi decoding")
+    st.markdown("## Drought Regime Analysis")
+    st.markdown(
+        "<div style='color:#888; font-size:0.85rem; line-height:1.35; margin-top:-0.4rem;'>"
+        "A 4-state Gaussian Hidden Markov Model that detects San Joaquin Valley drought "
+        "from precipitation and evapotranspiration alone."
+        "</div>",
+        unsafe_allow_html=True,
+    )
     st.divider()
 
     st.markdown("**Data**")
     st.markdown(
-        "GPM IMERG precip  \nOpenET monthly ET  \n"
-        "12-month rolling sums  \nz-scored by calendar month  \n"
-        "(equivalent to SPI-12 / ETI-12)  \n"
-        "241 months · 2000-12 – 2020-12"
+        "NASA GPM IMERG Late-Run precipitation  \n"
+        "OpenET Monthly Ensemble evapotranspiration  \n"
+        "<span style='color:#888'>241 months · Dec 2000 – Dec 2020</span>",
+        unsafe_allow_html=True,
     )
     st.divider()
 
     if not outputs_exist:
-        st.warning("No model outputs found.")
-        if st.button("Train model now", type="primary"):
-            run_and_cache_model()
+        st.warning("No model outputs found. Run `python main.py` to generate them.")
         st.stop()
-    else:
-        if st.button("Retrain model", type="secondary"):
-            run_and_cache_model()
 
-    st.divider()
     st.markdown("**Regime legend**")
     for k, label in REGIME_LABELS.items():
         color = REGIME_COLORS[k]
@@ -294,11 +294,23 @@ tab_convergence = tab_model
 with tab_map:
     st.markdown("### San Joaquin Valley Drought Map")
     st.caption(
-        "Each cell shows where it ranks against the same calendar month over the 21-year record. "
-        "A cell shaded **dark red** had its driest year for that month; **dark blue** had its wettest. "
-        "Same percentile-rank method the U.S. Drought Monitor uses — distribution-free, "
-        "directly interpretable, no σ scaling. Press ▶ to animate; drag the slider to scrub."
+        "Each square is a 10 km patch of the SJV. Its colour shows how dry or wet that patch was, "
+        "compared to all other Januaries (or Julys, etc.) in our 21-year record. "
+        "**Dark red** = driest version of that month ever recorded; "
+        "**dark blue** = wettest. Use the date picker, slider, or ▶ Play to step through time."
     )
+    with st.expander("📐 What this is, statistically"):
+        st.markdown(
+            "- Each cell's value is its **percentile rank** of the 12-month rolling precipitation "
+            "total against the 20 other instances of that same calendar month in the record.\n"
+            "- A rank of 1/21 ≈ 4.8% → driest such month ever → **D4 Exceptional** "
+            "(this is the same definition the U.S. Drought Monitor uses).\n"
+            "- The method is **distribution-free** — no Gaussian assumption, no σ scaling, no "
+            "deflation when the drought is part of the baseline. Each cell is compared only to "
+            "itself across years.\n"
+            "- Non-SJV pixels are masked NaN (white); a single black outline marks the "
+            "valley boundary."
+        )
 
     sp_lat, sp_lon, sp_dates, sp_grid = load_spatial()
     T = len(sp_dates)
@@ -482,11 +494,21 @@ with tab_map:
     # years; pale columns are wet years; bands across rows show seasonality.
     st.markdown("#### Drought Calendar — % of SJV in moderate-or-worse drought")
     st.caption(
-        "Each tile is one month over the 21-year record. Colour intensity is the "
-        "fraction of San Joaquin Valley cells that ranked in D1 (moderate drought) "
-        "or worse for that month. Vertical streaks of red are drought years "
-        "(2007–09, 2012–15, 2020); pale columns are wet years (2005, 2011, 2017)."
+        "A 12 × 21 calendar of the entire record. Each tile is one month; "
+        "**darker red = more of the valley was in drought that month**. "
+        "Vertical red streaks are drought *years* (2007–09, 2014–15, 2020); "
+        "pale-blue columns are wet years (2005, 2011, 2017). "
+        "Horizontal patterns would show seasonality."
     )
+    with st.expander("📐 What this is, statistically"):
+        st.markdown(
+            "- For every month and every SJV cell we have a percentile rank (from the map above).\n"
+            "- A cell is **in drought** if its rank is below the 33rd percentile of its "
+            "calendar-month history — that's the U.S. Drought Monitor's D0 threshold.\n"
+            "- Tile colour = the fraction of the 357 SJV cells in drought that month, in [0%, 100%].\n"
+            "- Pale blue at 0% = the entire valley was at or above normal; "
+            "dark red at 100% = every SJV cell was in drought."
+        )
 
     # Use the SJV mask (non-NaN cells in any frame) as the denominator —
     # ignoring the ~973 non-SJV cells fixes the "max 25%" display bug.
@@ -558,13 +580,28 @@ with tab_map:
 # TAB 0 — DROUGHT SEVERITY (continuous posterior)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_severity:
-    st.markdown("### Drought Intensity — Bayesian Posterior  P(drought | data)")
+    st.markdown("### Drought Intensity — how confident is the model that we're in drought?")
     st.caption(
-        "Continuous drought-severity score derived from the forward–backward smoothed posterior γₜ(k). "
-        "Unlike Viterbi (which forces a single hard label per month), this preserves the full probability "
-        "distribution over states — exactly what the U.S. Drought Monitor expresses as a severity gradient. "
-        "Score = γₜ(Drought) + 0.4·γₜ(Hot Regime)."
+        "A continuous score from 0% to 100% for every month, showing how strongly the model "
+        "believes the SJV was in drought conditions. Higher = deeper drought. "
+        "The coloured background bands match the U.S. Drought Monitor's "
+        "D0 → D4 severity scale, so you can read off what 'category' each month was in. "
+        "Annotated peaks line up with the real-world drought events."
     )
+    with st.expander("📐 What this is, statistically"):
+        st.markdown(
+            "- The HMM produces a smoothed posterior probability for every regime at every month:  \n"
+            "  $\\gamma_t(k) = \\Pr(Z_t = k \\mid X_{1:T})$  — computed by the forward–backward algorithm.\n"
+            "- Unlike **Viterbi decoding** (which picks the single most likely state per month), the "
+            "posterior preserves the full probability *distribution* across all four regimes. "
+            "That's what gives this view a smooth gradient instead of a step function.\n"
+            "- We summarise it into a drought-intensity score:  \n"
+            "  $\\text{DI}(t) = \\gamma_t(\\text{Drought}) + 0.4 \\cdot \\gamma_t(\\text{Hot Regime})$  \n"
+            "  — full weight on the persistent drought regime, partial weight on the hot/warming "
+            "regime since it's also dry but with different physical drivers.\n"
+            "- The USDM-style D0–D4 bands map this score to standard drought categories so the "
+            "result is directly comparable to published drought reports."
+        )
 
     if gamma is None:
         st.error("Posterior gamma not found. Run `python main.py` to regenerate outputs.")
@@ -674,17 +711,30 @@ with tab_severity:
 with tab_timeline:
     st.markdown("### Regime Probability Over Time")
     st.caption(
-        "Smoothed posterior  γₜ(k) = P(Zₜ = k | X₁:T)  from the forward–backward algorithm. "
-        "Each panel shows one of the four latent regimes; the y-axis is the probability the model "
-        "assigns that month to that regime, given the entire observation sequence."
+        "The HMM discovered four climate 'archetypes' — Pluvial, Near-Normal, Hot, and Drought. "
+        "Each panel below tracks one archetype over time: the line shows how strongly the model "
+        "believes the SJV was in *that* archetype each month. 100% = the model is certain; "
+        "values in between mean it's split between this archetype and a neighbour."
     )
     st.info(
-        "💡 The 'Drought' regime only fires when both SPI-12 *and* ETI-12 are deeply anomalous "
-        "(μ ≈ −0.8σ, −0.9σ). The famous 2012–2017 California drought was a multi-year *period* of "
-        "varying severity that peaked in 2014–2015 (SPI-12 ≈ −1.4σ); 2012–13 were dryish but not yet "
-        "at the regime centroid, so they correctly classify as Near-Normal here. "
-        "For partial-credit drought intensity during the buildup years, see the **Drought Severity** tab."
+        "💡 The 'Drought' panel only lights up when conditions are *deeply* anomalous on both "
+        "precipitation and ET. The famous 2012–2017 California drought was a multi-year stretch "
+        "of varying severity that peaked sharply in 2014–2015; 2012–13 were dry but not yet "
+        "at the Drought archetype's centroid, so they classify as Near-Normal here. "
+        "For partial-credit drought during the buildup years, see the **Drought Severity** tab."
     )
+    with st.expander("📐 What this is, statistically"):
+        st.markdown(
+            "- The HMM has 4 hidden states (regimes). For every month it computes the smoothed "
+            "posterior probability of being in each:  \n"
+            "  $\\gamma_t(k) = \\Pr(Z_t = k \\mid X_{1:T})$\n"
+            "- Computed by the **forward–backward algorithm** — uses both past *and* future "
+            "observations to refine the probability at each time step.\n"
+            "- For every month, the four panels sum to 100% (the regime must be exactly one of the four).\n"
+            "- Compare to **Viterbi MAP decoding**, which would pick the single argmax regime per "
+            "month — fine, but loses uncertainty. The posterior shows when the model was on the "
+            "fence between two regimes (look for plateaus around 30–70% instead of 0/100% spikes)."
+        )
 
     # Small-multiples: one row per regime — every row reads independently
     # as a normal time series, far more interpretable than a colour-density
@@ -747,17 +797,34 @@ with tab_timeline:
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_obs:
     # ── Emission space + Gaussian ellipses ───────────────────────────────────
-    st.markdown("### Emission space — observations and learned Gaussian fits")
+    st.markdown("### Where each regime lives — observations + learned ellipses")
     st.caption(
-        "Each point is one month at its (SPI-12, ETI-12) coordinates, coloured by the regime "
-        "the HMM assigned via Viterbi. The dashed lines mark normal (z = 0). "
-        "Around each regime's mean (◆), two ellipses show the 1σ and 2σ contours of the learned "
-        "2D Gaussian emission  Xₜ | Zₜ = k  ∼  𝒩(μₖ, Σₖ).  "
-        "The 1σ ellipse encloses ~39% of that regime's probability mass; the 2σ ellipse ~86%. "
-        "**Quadrants**: left = precip deficit, upper = above-normal ET. "
-        "Drought (red) sits bottom-left; Hot Regime (amber) upper-right; Pluvial (blue) top-right; "
-        "Near-Normal (grey) hugs the origin."
+        "Each dot is one month, positioned by **how anomalous its precipitation was** (horizontal) "
+        "and **how anomalous its ET was** (vertical). The dashed lines are 'normal'. "
+        "Dots are coloured by the regime the model assigned them. "
+        "Around each regime's centre (◆) you see two ellipses — the model thinks "
+        "**~40% of that regime's months land inside the inner ellipse**, **~86% inside the outer one**.\n\n"
+        "Read the quadrants: left = drier than normal, right = wetter; top = higher ET, bottom = lower ET. "
+        "**Drought** (red) clusters bottom-left, **Hot Regime** (amber) top-right, "
+        "**Pluvial** (blue) top-right with high precip, **Near-Normal** (grey) hugs the origin."
     )
+    with st.expander("📐 What this is, statistically"):
+        st.markdown(
+            "- The HMM uses a **multivariate Gaussian emission model**: given regime $k$, the "
+            "observation is distributed as  \n"
+            "  $X_t \\mid Z_t = k \\;\\sim\\; \\mathcal{N}(\\boldsymbol{\\mu}_k, \\boldsymbol{\\Sigma}_k)$\n"
+            "- Each ellipse is a **level set** of that Gaussian's probability density — the locus "
+            "of points satisfying  $(x - \\mu_k)^\\top \\Sigma_k^{-1} (x - \\mu_k) = c^2$.\n"
+            "- For $c = 1$ the ellipse encloses ~39% of the probability mass (the 2-D analogue of "
+            "'1σ'); for $c = 2$ it encloses ~86%. (Note: these are *not* the familiar 68% / 95% — "
+            "those are the 1-D values; in 2D the same $c$ encloses less mass.)\n"
+            "- Ellipses are computed by **eigendecomposition** of $\\Sigma_k$: the eigenvectors give "
+            "the principal axes (rotation), the eigenvalues give the variance along each axis "
+            "(stretching).\n"
+            "- The orientation/tilt of an ellipse reveals **covariance** — a tilted ellipse means "
+            "precip and ET are correlated within that regime; an axis-aligned ellipse means they "
+            "vary independently."
+        )
 
     def _ellipse(mu, cov, k_sigma, n=120):
         """(x,y) coords of the k_sigma confidence ellipse for 𝒩(mu, cov)."""
@@ -867,18 +934,39 @@ with tab_obs:
 with tab_params:
     st.markdown("### Learned HMM Parameters")
     st.caption(
-        "These are the parameters Baum-Welch converged on. "
-        "**Transition matrix A** tells you how likely each regime is to switch to another next month. "
-        "**Emission means μₖ** locate each regime in (SPI-12, ETI-12) space. "
-        "**Stationary distribution π̄** is the long-run fraction of time the chain spends in each regime."
+        "The numbers the model converged on after training. Three sections:\n\n"
+        "1. **Transition matrix** — how the model expects the SJV to *switch* between regimes month to month.\n"
+        "2. **Emission means** — what 'typical' precipitation and ET look like inside each regime.\n"
+        "3. **Stationary distribution** — if the SJV ran forever under this model, what fraction "
+        "of months would it spend in each regime?"
     )
+    with st.expander("📐 What this is, statistically"):
+        st.markdown(
+            "An HMM is fully specified by three pieces:\n\n"
+            "- **Initial distribution**  $\\pi$  — probabilities of starting in each regime.\n"
+            "- **Transition matrix**  $A_{jk} = \\Pr(Z_t = k \\mid Z_{t-1} = j)$ — a $K \\times K$ "
+            "stochastic matrix; each row sums to 1.\n"
+            "- **Emission parameters**  $\\boldsymbol{\\mu}_k, \\boldsymbol{\\Sigma}_k$ — the mean and "
+            "covariance of the multivariate Gaussian that generates observations when the chain is "
+            "in regime $k$.\n\n"
+            "All three are learned from the data via **Baum-Welch** (the EM algorithm for HMMs), "
+            "starting from k-means initialisation of the means and an identity-matrix covariance.\n\n"
+            "The **stationary distribution** $\\bar{\\pi}$ is the unique probability vector "
+            "satisfying $\\bar{\\pi}^\\top A = \\bar{\\pi}^\\top$ — i.e., the left eigenvector of "
+            "$A$ with eigenvalue 1. It tells you the long-run fraction of time the Markov chain "
+            "spends in each regime."
+        )
 
     col_A, col_mus = st.columns([1, 1])
     DARK = "#1a1a1a"
 
     with col_A:
-        st.markdown("#### Transition matrix  A")
-        st.caption("Aⱼₖ = P(regime next month = k | regime this month = j). Rows sum to 1.")
+        st.markdown("#### Transition matrix")
+        st.caption(
+            "Read row → column: 'if I'm in regime X this month, what's the chance I'm in "
+            "regime Y next month?' Diagonal values are *self-transitions* — how persistent each "
+            "regime is. High diagonals (e.g. 0.9) mean the regime tends to last several months."
+        )
 
         labels = [REGIME_LABELS[k] for k in range(4)]
         fig5 = go.Figure(go.Heatmap(
@@ -910,7 +998,11 @@ with tab_params:
 
     with col_mus:
         st.markdown("#### Emission means and standard deviations")
-        st.caption("μₖ in σ units (input is z-scored); σ is the regime's spread along each axis.")
+        st.caption(
+            "For each regime: where its 'centre' sits in precipitation/ET space (μ) and how "
+            "wide a spread of months it covers (σ). Values are in standard-deviation units, so "
+            "+1.0 = one σ above the long-term mean, −1.0 = one σ below."
+        )
 
         rows = []
         for k in range(4):
@@ -924,8 +1016,11 @@ with tab_params:
         st.dataframe(pd.DataFrame(rows).set_index("Regime"),
                      use_container_width=True)
 
-        st.markdown("#### Stationary distribution  π̄")
-        st.caption("Left eigenvector of A with eigenvalue 1 — the long-run fraction of months in each regime.")
+        st.markdown("#### Stationary distribution")
+        st.caption(
+            "If the SJV ran forever under this model, what fraction of months would it spend "
+            "in each regime? Mathematically: the long-run balance of the Markov chain."
+        )
         eigvals, eigvecs = np.linalg.eig(A.T)
         idx = np.argmin(np.abs(eigvals - 1.0))
         stat = np.abs(np.real(eigvecs[:, idx]))
@@ -941,10 +1036,25 @@ with tab_params:
 with tab_convergence:
     st.markdown("#### Baum-Welch convergence")
     st.caption(
-        "Log-likelihood log P(X | θ) at each EM iteration. "
-        "Should be monotonically increasing — that's the EM guarantee. "
-        "Flattening means the parameters have settled at a local optimum."
+        "How well the model fit improved with each training iteration. "
+        "The line should always go up (better fit) and flatten out — that's the "
+        "model finding its best possible parameters and stopping."
     )
+    with st.expander("📐 What this is, statistically"):
+        st.markdown(
+            "- We train the HMM by maximising the **log-likelihood** of the observed data:  \n"
+            "  $\\log \\Pr(X_{1:T} \\mid \\theta)$  where $\\theta = (\\pi, A, \\mu_k, \\Sigma_k)$.\n"
+            "- This is done with **Baum-Welch** — the Expectation-Maximisation algorithm specialised "
+            "for HMMs. Each iteration alternates:\n"
+            "  - **E-step**: compute posterior probabilities of being in each regime at each time, "
+            "given current parameters (the forward-backward algorithm).\n"
+            "  - **M-step**: update $\\theta$ to maximise the expected complete-data log-likelihood "
+            "under those posteriors (closed-form updates for $\\pi$, $A$, $\\mu_k$, $\\Sigma_k$).\n"
+            "- A core theorem of EM: **each iteration is guaranteed to increase the log-likelihood "
+            "(or leave it unchanged)** — that's why the curve is monotone.\n"
+            "- We stop when the iteration-over-iteration change drops below $10^{-4}$, i.e. when "
+            "the optimisation has converged to a (local) optimum."
+        )
 
     if log_likelihoods is not None and len(log_likelihoods) > 0:
         fig8 = go.Figure(go.Scatter(
