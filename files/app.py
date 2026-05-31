@@ -375,7 +375,7 @@ with tab_map:
 
     # ── Single source of truth for the displayed month ───────────────────────
     if "map_idx" not in st.session_state:
-        st.session_state["map_idx"] = len(sp_dates) - 1
+        st.session_state["map_idx"] = 0       # ← start at first month (Dec 2000)
     if "map_playing" not in st.session_state:
         st.session_state["map_playing"] = False
 
@@ -476,41 +476,71 @@ with tab_map:
                disabled=not st.session_state["map_playing"],
                use_container_width=True)
 
-    # ── Time-series stack: % of SJV in each USDM category over time ──────────
-    st.markdown("#### % of SJV in each USDM category, over time")
+    # ── Drought Calendar: months × years heatmap ─────────────────────────────
+    # Each cell = one month. Colour = % of the SJV in moderate-or-worse drought
+    # (D1+) for that month. Read-at-a-glance: dark red columns are drought
+    # years; pale columns are wet years; bands across rows show seasonality.
+    st.markdown("#### Drought Calendar — % of SJV in moderate-or-worse drought")
     st.caption(
-        "Stacked area — the dark-red band thickening through 2008–09 and 2014–15 is the "
-        "core mega-drought signal. Look for thick blue bands in 2011, 2016–17, 2019."
+        "Each tile is one month over the 21-year record. Colour intensity is the "
+        "fraction of San Joaquin Valley cells that ranked in D1 (moderate drought) "
+        "or worse for that month. Vertical streaks of red are drought years "
+        "(2007–09, 2012–15, 2020); pale columns are wet years (2005, 2011, 2017)."
     )
 
-    pct_in_cat = {}
-    for label, color, lo, hi in USDM:
-        m = (sp_grid >= lo) & (sp_grid < hi)
-        pct_in_cat[label] = 100 * np.nanmean(m, axis=(1, 2))   # (T,)
+    # Use the SJV mask (non-NaN cells in any frame) as the denominator —
+    # ignoring the ~973 non-SJV cells fixes the "max 25%" display bug.
+    sjv_mask_full = ~np.isnan(sp_grid[0])
+    sjv_n = max(int(sjv_mask_full.sum()), 1)
+    pct_in_drought = np.zeros(T, dtype=float)
+    for t in range(T):
+        in_drought = (sp_grid[t] < 0.33) & sjv_mask_full      # D0 or worse
+        pct_in_drought[t] = 100 * int(in_drought.sum()) / sjv_n
 
-    fig_ts = go.Figure()
-    # Stack from driest (bottom) to wettest (top) for a clean visual narrative
-    for label, color, lo, hi in USDM:
-        fig_ts.add_trace(go.Scatter(
-            x=sp_dates, y=pct_in_cat[label],
-            mode="lines",
-            stackgroup="usdm",
-            name=label,
-            line=dict(width=0),
-            fillcolor=color,
-            hovertemplate=("<b>%{x|%b %Y}</b><br>" + label + ": %{y:.0f}% of SJV<extra></extra>"),
-        ))
-    fig_ts.update_layout(
-        **PLOTLY_LAYOUT,
+    years = sorted({d.year for d in sp_dates})
+    year_idx = {y: i for i, y in enumerate(years)}
+    cal = np.full((12, len(years)), np.nan)
+    for t, d in enumerate(sp_dates):
+        cal[d.month - 1, year_idx[d.year]] = pct_in_drought[t]
+
+    fig_cal = go.Figure(go.Heatmap(
+        z=cal,
+        x=years,
+        y=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"],
+        zmin=0, zmax=100,
+        colorscale=[
+            [0.00, "#DCEEF6"],   # 0%   — pale blue (no drought, distinct from page bg)
+            [0.20, "#FFF2B3"],   # 20%  — pale yellow
+            [0.40, "#FFCB73"],   # 40%  — orange
+            [0.60, "#E66B00"],   # 60%  — deep orange
+            [0.80, "#A60000"],   # 80%  — red
+            [1.00, "#5C0000"],   # 100% — dark red
+        ],
+        xgap=2, ygap=2,
+        hovertemplate=(
+            "<b>%{y} %{x}</b><br>"
+            "%{z:.0f}% of SJV in drought (D1+)<extra></extra>"
+        ),
+        colorbar=dict(
+            title=dict(text="% of SJV<br>in drought", side="right",
+                       font=dict(color=AXIS_DARK, size=12)),
+            tickvals=[0, 25, 50, 75, 100],
+            ticktext=["0%", "25%", "50%", "75%", "100%"],
+            tickfont=dict(color=AXIS_DARK, size=11),
+            len=0.85, thickness=14, outlinewidth=0,
+        ),
+    ))
+    fig_cal.update_layout(
+        **{**PLOTLY_LAYOUT, "margin": dict(l=44, r=24, t=24, b=40)},
         height=380,
-        yaxis=dict(title="% of SJV", range=[0, 100], ticksuffix="%",
-                   showgrid=True, gridcolor="#f0f0f0"),
-        xaxis=dict(showgrid=False, title=None),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02,
-                    xanchor="left", x=0, itemsizing="constant",
-                    font=dict(size=10)),
+        xaxis=dict(title=None, type="category",
+                   tickfont=dict(color=AXIS_DARK, size=11),
+                   showgrid=False, showline=False),
+        yaxis=dict(title=None, autorange="reversed",
+                   tickfont=dict(color=AXIS_DARK, size=11),
+                   showgrid=False, showline=False),
     )
-    st.plotly_chart(fig_ts, use_container_width=True, theme=None)
+    st.plotly_chart(fig_cal, use_container_width=True, theme=None)
 
     # ── Auto-advance when playing ────────────────────────────────────────────
     # Streamlit-driven: write to _map_target, rerun. Next run applies it to
@@ -644,58 +674,71 @@ with tab_severity:
 with tab_timeline:
     st.markdown("### Regime Probability Over Time")
     st.caption(
-        "Each row shows the posterior probability γₜ(k) = P(regime = k | data) for that regime. "
-        "Solid colour = ~100% probability, faded = lower probability. "
-        "Unlike a Viterbi MAP ribbon, this reveals **intensity** and **uncertainty** — "
-        "in the lead-up to the 2014 mega-drought peak you can see Drought probability "
-        "rising gradually from 2012 while Near-Normal fades."
+        "Smoothed posterior  γₜ(k) = P(Zₜ = k | X₁:T)  from the forward–backward algorithm. "
+        "Each panel shows one of the four latent regimes; the y-axis is the probability the model "
+        "assigns that month to that regime, given the entire observation sequence."
+    )
+    st.info(
+        "💡 The 'Drought' regime only fires when both SPI-12 *and* ETI-12 are deeply anomalous "
+        "(μ ≈ −0.8σ, −0.9σ). The famous 2012–2017 California drought was a multi-year *period* of "
+        "varying severity that peaked in 2014–2015 (SPI-12 ≈ −1.4σ); 2012–13 were dryish but not yet "
+        "at the regime centroid, so they correctly classify as Near-Normal here. "
+        "For partial-credit drought intensity during the buildup years, see the **Drought Severity** tab."
     )
 
-    # Stack order: wet/normal on top, drought/hot at bottom for visual narrative
-    row_order = [0, 3, 2, 1]    # Pluvial → Near-Normal → Hot → Drought
+    # Small-multiples: one row per regime — every row reads independently
+    # as a normal time series, far more interpretable than a colour-density
+    # heatmap. Order from wet → dry top-to-bottom for narrative flow.
+    row_order = [0, 3, 2, 1]   # Pluvial → Near-Normal → Hot → Drought
 
-    fig = go.Figure()
-    for k in row_order:
-        base = REGIME_COLORS[k]
-        # Build a colorscale from transparent to the regime's full colour
-        # so colour intensity directly encodes γ.
-        colorscale = [
-            [0.00, "rgba(255,255,255,0)"],
-            [0.10, "rgba(255,255,255,0)"],   # below 10% reads as empty
-            [1.00, base],
-        ]
-        fig.add_trace(go.Heatmap(
-            z=[gamma[:, k]],
-            x=dates,
-            y=[REGIME_LABELS[k]],
-            colorscale=colorscale,
-            zmin=0, zmax=1,
-            showscale=False,
-            xgap=0, ygap=2,
+    def _hex_to_rgba(hex_color, alpha):
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.035,
+        subplot_titles=[REGIME_LABELS[k] for k in row_order],
+    )
+    for row_i, k in enumerate(row_order, start=1):
+        color = REGIME_COLORS[k]
+        fig.add_trace(go.Scatter(
+            x=dates, y=gamma[:, k],
+            mode="lines",
+            line=dict(color=color, width=1.6),
+            fill="tozeroy",
+            fillcolor=_hex_to_rgba(color, 0.30),
             hovertemplate=(
-                "<b>%{x|%b %Y}</b><br>"
-                f"γ({REGIME_LABELS[k]}) = %{{z:.0%}}<extra></extra>"
+                f"<b>{REGIME_LABELS[k]}</b><br>"
+                "%{x|%b %Y}<br>γ = %{y:.0%}<extra></extra>"
             ),
-        ))
+            showlegend=False,
+        ), row=row_i, col=1)
+        # Subtle reference lines at 50% and 100%
+        fig.add_hline(y=0.5, line_dash="dot", line_color="#cccccc", line_width=1, row=row_i, col=1)
 
+    DARK = "#1a1a1a"
     fig.update_layout(
-        **{**PLOTLY_LAYOUT, "margin": dict(l=160, r=24, t=30, b=50)},
-        height=280,
-        xaxis=dict(
-            showgrid=False, title=None,
-            tickfont=dict(size=11, color="#1a1a1a"),
-            ticks="outside", tickcolor="#1a1a1a",
-            showline=True, linecolor="#1a1a1a",
-        ),
-        yaxis=dict(
-            title=None,
-            showgrid=False,
-            tickfont=dict(size=13, color="#1a1a1a"),
-            categoryorder="array",
-            categoryarray=[REGIME_LABELS[k] for k in row_order],
-        ),
+        **{**PLOTLY_LAYOUT, "margin": dict(l=48, r=24, t=40, b=40)},
+        height=520,
         showlegend=False,
     )
+    fig.update_xaxes(showgrid=False, showline=True, linecolor=DARK,
+                     tickfont=dict(color=DARK, size=10),
+                     ticks="outside", tickcolor=DARK)
+    fig.update_yaxes(range=[0, 1.02], tickformat=".0%",
+                     showgrid=True, gridcolor="#eaeaea",
+                     showline=True, linecolor=DARK,
+                     tickfont=dict(color=DARK, size=10),
+                     tickvals=[0, 0.5, 1.0])
+    # Style the subplot titles (regime labels) to be left-aligned, bold, in regime colour
+    for i, k in enumerate(row_order):
+        fig.layout.annotations[i].update(
+            font=dict(size=13, color=REGIME_COLORS[k]),
+            x=0.0, xanchor="left",
+        )
     st.plotly_chart(fig, use_container_width=True, theme=None)
 
 
@@ -703,17 +746,43 @@ with tab_timeline:
 # TAB 2 — OBSERVATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_obs:
-    # ── scatter: precip vs ET coloured by regime (emission space) ────────────
-    st.markdown("### Where each regime lives in observation space")
+    # ── Emission space + Gaussian ellipses ───────────────────────────────────
+    st.markdown("### Emission space — observations and learned Gaussian fits")
     st.caption(
-        "Every month is a point at its (SPI-12, ETI-12) coordinates — coloured by the regime "
-        "the HMM assigned it. The ✕ marks the learned Gaussian mean μₖ for each regime. "
-        "Quadrants: **left half** = below-normal precipitation, **upper half** = above-normal ET. "
-        "Drought (red) clusters bottom-left (dry + suppressed ET); Hot Regime (amber) sits upper-right; "
-        "Pluvial (blue) is top-right; Near-Normal (grey) hugs the origin."
+        "Each point is one month at its (SPI-12, ETI-12) coordinates, coloured by the regime "
+        "the HMM assigned via Viterbi. The dashed lines mark normal (z = 0). "
+        "Around each regime's mean (◆), two ellipses show the 1σ and 2σ contours of the learned "
+        "2D Gaussian emission  Xₜ | Zₜ = k  ∼  𝒩(μₖ, Σₖ).  "
+        "The 1σ ellipse encloses ~39% of that regime's probability mass; the 2σ ellipse ~86%. "
+        "**Quadrants**: left = precip deficit, upper = above-normal ET. "
+        "Drought (red) sits bottom-left; Hot Regime (amber) upper-right; Pluvial (blue) top-right; "
+        "Near-Normal (grey) hugs the origin."
     )
 
+    def _ellipse(mu, cov, k_sigma, n=120):
+        """(x,y) coords of the k_sigma confidence ellipse for 𝒩(mu, cov)."""
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        eigvals = np.clip(eigvals, 0, None)
+        theta = np.linspace(0, 2 * np.pi, n)
+        circle = np.stack([np.cos(theta), np.sin(theta)], axis=0)
+        scaled = np.diag(np.sqrt(eigvals) * k_sigma) @ circle
+        rot = eigvecs @ scaled
+        return mu[0] + rot[0], mu[1] + rot[1]
+
+    def _hex_rgba(hex_color, alpha):
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    # Σ in observation space  (z-score units, same as obs_df columns)
+    # mus_phys is already in obs units; rescale Σ similarly:
+    #   Σ_obs[k] = D · Σ_norm[k] · D,  where D = diag(obs_std)
+    D = np.diag(obs_std)
+    sigmas_obs = np.array([D @ sigmas[k] @ D for k in range(4)])
+
     fig4 = go.Figure()
+
+    # 1. Data points
     for k in range(4):
         mask = obs_df["state"] == k
         fig4.add_trace(go.Scatter(
@@ -721,38 +790,55 @@ with tab_obs:
             y=obs_df.loc[mask, "et_anom"],
             mode="markers",
             name=REGIME_LABELS[k],
-            marker=dict(color=REGIME_COLORS[k], size=3, opacity=0.4),
+            marker=dict(color=REGIME_COLORS[k], size=7,
+                        opacity=0.65,
+                        line=dict(color="white", width=0.5)),
             hovertemplate=(
-                "SPI-3: %{x:+.2f}σ<br>ETI-3: %{y:+.2f}σ"
-                "<extra>" + REGIME_LABELS[k] + "</extra>"
-            ),
-        ))
-        # emission mean
-        fig4.add_trace(go.Scatter(
-            x=[mus_phys[k, 0]], y=[mus_phys[k, 1]],
-            mode="markers+text",
-            marker=dict(
-                symbol="x", color=REGIME_COLORS[k],
-                size=14, line=dict(width=2.5),
-            ),
-            text=[REGIME_LABELS[k]],
-            textposition="top center",
-            textfont=dict(size=11, color=REGIME_COLORS[k]),
-            showlegend=False,
-            hovertemplate=(
-                f"<b>μ — {REGIME_LABELS[k]}</b><br>"
-                f"SPI-3: {mus_phys[k,0]:+.2f}σ<br>"
-                f"ETI-3: {mus_phys[k,1]:+.2f}σ<extra></extra>"
+                "<b>" + REGIME_LABELS[k] + "</b><br>"
+                "SPI-12: %{x:+.2f}σ<br>ETI-12: %{y:+.2f}σ<extra></extra>"
             ),
         ))
 
-    # quadrant guides
+    # 2. Confidence ellipses (2σ first so 1σ draws on top)
+    for k in range(4):
+        mu = mus_phys[k]
+        for k_sig, alpha_fill, alpha_line in [(2.0, 0.06, 0.55),
+                                              (1.0, 0.14, 0.95)]:
+            ex, ey = _ellipse(mu, sigmas_obs[k], k_sig)
+            fig4.add_trace(go.Scatter(
+                x=ex, y=ey,
+                mode="lines",
+                line=dict(color=REGIME_COLORS[k], width=1.6),
+                opacity=alpha_line,
+                fill="toself",
+                fillcolor=_hex_rgba(REGIME_COLORS[k], alpha_fill),
+                showlegend=False, hoverinfo="skip",
+            ))
+
+    # 3. Means
+    for k in range(4):
+        mu = mus_phys[k]
+        fig4.add_trace(go.Scatter(
+            x=[mu[0]], y=[mu[1]],
+            mode="markers+text",
+            marker=dict(symbol="diamond", color=REGIME_COLORS[k],
+                        size=18, line=dict(color="white", width=2.5)),
+            text=[f"  μ — {REGIME_LABELS[k]}"],
+            textposition="middle right",
+            textfont=dict(size=12, color=REGIME_COLORS[k]),
+            showlegend=False,
+            hovertemplate=(
+                f"<b>μ — {REGIME_LABELS[k]}</b><br>"
+                f"SPI-12: {mu[0]:+.2f}σ<br>ETI-12: {mu[1]:+.2f}σ<extra></extra>"
+            ),
+        ))
+
     fig4.add_hline(y=0, line_dash="dash", line_color="#bbb", line_width=1)
     fig4.add_vline(x=0, line_dash="dash", line_color="#bbb", line_width=1)
 
     fig4.update_layout(
         **PLOTLY_LAYOUT,
-        height=460,
+        height=560,
         xaxis=dict(
             title=dict(text="SPI-12 — precipitation anomaly (σ)",
                        font=dict(color="#1a1a1a", size=13)),
