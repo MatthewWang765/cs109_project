@@ -199,6 +199,34 @@ def load_spatial_spi(precip_path, window=12):
     )
 
 
+def load_raw_monthly(precip_path, et_path):
+    """
+    Return raw monthly totals (no z-scoring) for the SJV mean time series.
+
+    Returns
+    -------
+    precip_monthly : pd.Series  mm/month, index = month-start DatetimeIndex
+    et_monthly     : pd.Series  mm/month, same index
+    dates          : pd.DatetimeIndex
+    """
+    gpm   = xr.open_dataset(precip_path)
+    et_ds = xr.open_dataset(et_path)
+
+    precip_daily = gpm["precip_mean"].to_series()
+    precip_daily.index = pd.DatetimeIndex(precip_daily.index).normalize()
+    precip_monthly = precip_daily.resample("MS").sum().rename("precip_mm")
+
+    et_monthly = et_ds["et_mean"].to_series().rename("et_mm")
+    et_monthly.index = (
+        pd.DatetimeIndex(et_monthly.index)
+        .to_period("M").to_timestamp("M") - pd.offsets.MonthBegin(1)
+    )
+
+    df = pd.DataFrame({"precip_mm": precip_monthly, "et_mm": et_monthly})
+    df = df[(df.index.year >= 2000) & (df.index.year <= 2020)].dropna()
+    return df["precip_mm"], df["et_mm"], df.index
+
+
 def load_csv(path):
     """
     Load daily SJV observations from a CSV file.

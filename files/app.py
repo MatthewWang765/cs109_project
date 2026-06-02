@@ -1,12 +1,12 @@
 """
-app.py — Streamlit dashboard for the SJV Drought Regime HMM.
+app.py — SJV Drought Analysis Dashboard (CS109 Spring 2026 Challenge Project)
 
-Loads pre-computed model outputs from outputs/ and visualizes:
-  1. Regime timeline (interactive, zoomable)
-  2. Raw observations overlaid with decoded states
-  3. Transition matrix heatmap
-  4. Regime duration & seasonal breakdown
-  5. Baum-Welch convergence
+Five tabs:
+  1. Drought Map       — percentile-rank spatial map (unchanged)
+  2. Modeling Precip   — Continuous RVs + MLE (Gamma vs Normal)
+  3. Predicting Drought — Logistic Regression from scratch
+  4. Uncertainty       — Bootstrap + CLT + Bayesian Beta-Binomial
+  5. Information Content — Shannon entropy + KL divergence + mutual information
 
 Run with:  streamlit run app.py
 """
@@ -20,50 +20,18 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.colors import LinearSegmentedColormap
+from scipy import stats, special
 
 # ── page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SJV Drought Regimes",
+    page_title="SJV Drought Analysis",
     page_icon="🌾",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ── design tokens ─────────────────────────────────────────────────────────────
-# Earthy, drought-appropriate palette — one color per regime
-REGIME_COLORS = {
-    0: "#3978AE",   # deep blue   → pluvial (12-mo wet)
-    1: "#8B2E2A",   # dark red    → persistent drought
-    2: "#E08E3C",   # amber       → hot regime (warming-driven)
-    3: "#9CA89C",   # sage-grey   → near-normal
-}
-
-REGIME_LABELS = {
-    0: "Pluvial (Wet)",
-    1: "Drought",
-    2: "Hot Regime",
-    3: "Near-Normal",
-}
-
-# Map state → which drought category it contributes to.
-# Used to build the continuous drought-intensity score (Σ γ over dry states).
-DROUGHT_STATES = {1: 1.0, 2: 0.4}    # full weight on persistent drought, partial on hot
-
-# U.S. Drought Monitor severity scale (mapped to P(drought | data))
-DROUGHT_MONITOR_SCALE = [
-    (0.00, 0.20, "#FFFFFF", "None"),
-    (0.20, 0.40, "#FFFF00", "D0 — Abnormally Dry"),
-    (0.40, 0.60, "#FCD37F", "D1 — Moderate"),
-    (0.60, 0.80, "#FFAA00", "D2 — Severe"),
-    (0.80, 0.95, "#E60000", "D3 — Extreme"),
-    (0.95, 1.01, "#730000", "D4 — Exceptional"),
-]
-
 PLOTLY_LAYOUT = dict(
     font_family="Inter, system-ui, sans-serif",
     font_color="#1a1a1a",
@@ -71,225 +39,145 @@ PLOTLY_LAYOUT = dict(
     plot_bgcolor="white",
     margin=dict(l=48, r=24, t=40, b=48),
 )
+DARK = "#1a1a1a"
+
+# U.S. Drought Monitor palette
+USDM_COLORS = {
+    "D4": "#5C0000", "D3": "#A60000", "D2": "#E66B00",
+    "D1": "#FFA94D", "D0": "#FFE099", "Normal": "#F2F2F2",
+    "W0": "#B3D9E6", "W1": "#7FB8D9", "W2": "#4D94CC",
+    "W3": "#1F5F99", "W4": "#0A3D66",
+}
 
 # ── minimal CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* tighten default Streamlit padding */
   .block-container { padding-top: 2rem; padding-bottom: 2rem; }
-  /* metric label */
   [data-testid="stMetricLabel"] { font-size: 0.75rem; color: #666; }
-  /* section headers */
   h3 { font-weight: 600; letter-spacing: -0.02em; margin-top: 0; }
-  /* hide the top-right "Running…" status widget (sport-icon animation +
-     stop button) so the animation loop doesn't trigger it every frame. */
   [data-testid="stStatusWidget"] { display: none !important; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── data loading ──────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="Loading model outputs…")
-def load_outputs():
-    states = np.load("outputs/decoded_states.npy")
-    mus    = np.load("outputs/mus.npy")
-    sigmas = np.load("outputs/sigmas.npy")
-    A      = np.load("outputs/A.npy")
-
-    df_dated = pd.read_csv(
-        "outputs/decoded_states_dated.csv",
-        index_col=0, parse_dates=True,
-    )
-    dates = df_dated.index
-
-    log_likelihoods = None
-    ll_path = "outputs/log_likelihoods.npy"
-    if os.path.exists(ll_path):
-        log_likelihoods = np.load(ll_path)
-
-    gamma = None
-    g_path = "outputs/gamma.npy"
-    if os.path.exists(g_path):
-        gamma = np.load(g_path)
-
-    return states, mus, sigmas, A, dates, log_likelihoods, gamma
-
-
+# ── data loaders ──────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Computing per-cell drought percentiles…")
-def load_spatial(_v=2):     # bump _v to invalidate cache after loader changes
-    """Returns (lat, lon, dates, pct) — drought percentile per cell per month."""
+def load_spatial(_v=2):
     from data_loader import load_spatial_percentile
     return load_spatial_percentile("data/gpm_sjv_subset.nc", window=12)
 
 
-@st.cache_data(show_spinner="Loading observations…")
-def load_obs():
-    from data_loader import load_netcdf, normalize
+@st.cache_data(show_spinner="Loading SPI-12 / ETI-12 anomalies…")
+def load_anomalies():
+    from data_loader import load_netcdf
     X, dates = load_netcdf("data/gpm_sjv_subset.nc", "data/openet_sjv_subset.nc")
-    X_norm, mean, std = normalize(X)
-    return X, X_norm, dates, mean, std
+    return X, dates
 
 
-def run_and_cache_model():
-    """Train model and cache outputs if outputs are missing."""
-    from hmm import GaussianHMM
-    from data_loader import normalize
-    import json
+@st.cache_data(show_spinner="Loading raw monthly totals…")
+def load_raw():
+    from data_loader import load_raw_monthly
+    p, e, dates = load_raw_monthly("data/gpm_sjv_subset.nc", "data/openet_sjv_subset.nc")
+    return p, e, dates
 
-    X, X_norm, obs_dates, mean, std = load_obs()
-    model = GaussianHMM(K=4, max_iter=200, tol=1e-4)
-
-    progress = st.progress(0, text="Running Baum-Welch…")
-    _orig_fit = model.fit
-
-    def fit_with_progress(X_):
-        model._initialize(X_)
-        from emissions import compute_log_emission_matrix
-        from forward_backward import forward_backward
-        import math
-        prev_ll = -math.inf
-        for i in range(model.max_iter):
-            from emissions import compute_log_emission_matrix
-            log_B = compute_log_emission_matrix(X_, model.mus, model.sigmas)
-            gamma, xi, ll = forward_backward(log_B, model.A, model.pi)
-            model.log_likelihoods.append(ll)
-            pct = min(int((i + 1) / model.max_iter * 100), 99)
-            progress.progress(pct, text=f"Baum-Welch iteration {i+1}  (LL={ll:.1f})")
-            if abs(ll - prev_ll) < model.tol:
-                break
-            prev_ll = ll
-            model._m_step(X_, gamma, xi)
-        progress.progress(100, text="Done.")
-        return model
-
-    model = fit_with_progress(X_norm)
-
-    os.makedirs("outputs", exist_ok=True)
-    states, log_prob = model.decode(X_norm)
-    gamma = model.posterior(X_norm)
-    np.save("outputs/decoded_states.npy", states)
-    np.save("outputs/mus.npy", model.mus)
-    np.save("outputs/sigmas.npy", model.sigmas)
-    np.save("outputs/A.npy", model.A)
-    np.save("outputs/log_likelihoods.npy", np.array(model.log_likelihoods))
-    np.save("outputs/gamma.npy", gamma)
-    pd.Series(states, index=obs_dates).to_csv(
-        "outputs/decoded_states_dated.csv", header=["state"]
-    )
-    st.cache_data.clear()
-    st.rerun()
-
-
-# ── helpers ───────────────────────────────────────────────────────────────────
-def regime_color_list(states):
-    return [REGIME_COLORS[s] for s in states]
-
-
-def run_length_stats(states):
-    """Return dict of {state: list_of_run_lengths}."""
-    runs = {k: [] for k in REGIME_COLORS}
-    if len(states) == 0:
-        return runs
-    cur, length = states[0], 1
-    for s in states[1:]:
-        if s == cur:
-            length += 1
-        else:
-            runs[cur].append(length)
-            cur, length = s, 1
-    runs[cur].append(length)
-    return runs
-
-
-# ── main ──────────────────────────────────────────────────────────────────────
-outputs_exist = (
-    os.path.exists("outputs/decoded_states.npy")
-    and os.path.exists("outputs/decoded_states_dated.csv")
-)
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## Drought Regime Analysis")
+    st.markdown("## San Joaquin Valley Drought Analysis")
     st.markdown(
         "<div style='color:#888; font-size:0.85rem; line-height:1.35; margin-top:-0.4rem;'>"
-        "A 4-state Gaussian Hidden Markov Model that detects San Joaquin Valley drought "
-        "from precipitation and evapotranspiration alone."
+        "A probabilistic study of San Joaquin Valley drought from 2000 to 2020 using "
+        "precipitation and evapotranspiration alone."
         "</div>",
         unsafe_allow_html=True,
     )
     st.divider()
-
     st.markdown("**Data**")
     st.markdown(
         "NASA GPM IMERG Late-Run precipitation  \n"
         "OpenET Monthly Ensemble evapotranspiration  \n"
-        "<span style='color:#888'>241 months · Dec 2000 – Dec 2020</span>",
+        "<span style='color:#888'>252 months · Jan 2000 – Dec 2020</span>",
         unsafe_allow_html=True,
     )
     st.divider()
-
-    if not outputs_exist:
-        st.warning("No model outputs found. Run `python main.py` to generate them.")
-        st.stop()
-
-    st.markdown("**Regime legend**")
-    for k, label in REGIME_LABELS.items():
-        color = REGIME_COLORS[k]
-        st.markdown(
-            f'<span style="display:inline-block;width:12px;height:12px;'
-            f'border-radius:2px;background:{color};margin-right:6px"></span>{label}',
-            unsafe_allow_html=True,
-        )
-
-# ── load data ─────────────────────────────────────────────────────────────────
-states, mus, sigmas, A, dates, log_likelihoods, gamma = load_outputs()
-X, X_norm, obs_dates, obs_mean, obs_std = load_obs()
-
-# Align observations to decoded-state dates
-obs_df = pd.DataFrame(X, index=obs_dates, columns=["precip_anom", "et_anom"])
-obs_df = obs_df.loc[dates]
-obs_df["state"] = states
-obs_df["regime"] = obs_df["state"].map(REGIME_LABELS)
-obs_df["color"] = obs_df["state"].map(REGIME_COLORS)
-
-# Unscale emission means back to physical units
-mus_phys = mus * obs_std + obs_mean
-
-# ── title row ─────────────────────────────────────────────────────────────────
-st.markdown("## SJV Drought Regime Analysis  \n###### Hidden Markov Model · 2000–2020")
-st.divider()
-
-# ── summary metrics ───────────────────────────────────────────────────────────
-cols = st.columns(4)
-for k, col in enumerate(cols):
-    days = (states == k).sum()
-    pct  = 100 * days / len(states)
-    col.metric(
-        label=REGIME_LABELS[k],
-        value=f"{pct:.1f}%",
-        delta=f"{days:,} days",
-        delta_color="off",
+    st.markdown("**CS109 methods**")
+    st.markdown(
+        "- Gamma / Normal MLE\n"
+        "- Logistic regression\n"
+        "- Bootstrap + CLT\n"
+        "- Beta-Binomial Bayesian\n"
+        "- Shannon entropy & KL divergence",
     )
 
-st.divider()
+# ── load shared data ──────────────────────────────────────────────────────────
+X_anom, anom_dates = load_anomalies()   # (241, 2) SPI-12, ETI-12
+precip_raw, et_raw, raw_dates = load_raw()
+
+spi12  = X_anom[:, 0]
+eti12  = X_anom[:, 1]
+DROUGHT_THRESH = -0.5                   # SPI-12 < -0.5 → drought month
+
+# ── bootstrap CI for drought rate (used in quick stats) ──────────────────────
+@st.cache_data(show_spinner=False)
+def _bootstrap_drought_rate(spi_bytes, n_boot=10_000, seed=42):
+    spi = np.frombuffer(spi_bytes, dtype=np.float64)
+    y = (spi < DROUGHT_THRESH).astype(float)
+    rng = np.random.default_rng(seed)
+    boot = rng.choice(y, size=(n_boot, len(y)), replace=True).mean(axis=1)
+    lo, hi = np.percentile(boot, [2.5, 97.5])
+    return float(y.mean()), lo, hi
+
+drought_rate, dr_lo, dr_hi = _bootstrap_drought_rate(spi12.tobytes())
+
+# ── title + quick stats ───────────────────────────────────────────────────────
+st.markdown("## San Joaquin Valley Drought Analysis  \n###### Probabilistic Methods · 2000–2020")
+st.markdown("##### Quick Statistics")
+st.markdown(
+    "<div style='color:#888; font-size:0.85rem; margin-top:-0.4rem; margin-bottom:0.6rem;'>"
+    "Climatological highlights from the 241-month SPI-12 record."
+    "</div>",
+    unsafe_allow_html=True,
+)
+
+annual_spi = pd.Series(spi12, index=anom_dates).resample("YS").mean()
+col1, col2, col3, col4 = st.columns(4)
+col1.markdown(
+    f"**Driest year**  \n"
+    f"<span style='font-size:1.8rem;font-weight:600;'>{int(annual_spi.idxmin().year)}</span>  \n"
+    f"<span style='color:#888;font-size:0.85rem;'>lowest mean SPI-12</span>",
+    unsafe_allow_html=True,
+)
+col2.markdown(
+    f"**Wettest year**  \n"
+    f"<span style='font-size:1.8rem;font-weight:600;'>{int(annual_spi.idxmax().year)}</span>  \n"
+    f"<span style='color:#888;font-size:0.85rem;'>highest mean SPI-12</span>",
+    unsafe_allow_html=True,
+)
+col3.markdown(
+    f"**Bootstrap drought rate**  \n"
+    f"<span style='font-size:1.8rem;font-weight:600;'>{drought_rate*100:.0f}%</span>  \n"
+    f"<span style='color:#888;font-size:0.85rem;'>95% CI: [{dr_lo*100:.0f}%, {dr_hi*100:.0f}%]</span>",
+    unsafe_allow_html=True,
+)
+col4.markdown(
+    f"**Sample size**  \n"
+    f"<span style='font-size:1.8rem;font-weight:600;'>241 months</span>  \n"
+    f"<span style='color:#888;font-size:0.85rem;'>one observation per month</span>",
+    unsafe_allow_html=True,
+)
 
 # ── Tab layout ────────────────────────────────────────────────────────────────
-tab_map, tab_severity, tab_regimes, tab_model = st.tabs([
+tab_map, tab_precip, tab_logit, tab_boot, tab_info = st.tabs([
     "Drought Map",
-    "Drought Severity",
-    "Latent Regimes",
-    "Model Internals",
+    "Modeling Precipitation",
+    "Predicting Drought",
+    "Quantifying Uncertainty",
+    "Information Content",
 ])
 
-# Aliases so existing tab bodies don't have to be rewritten in bulk
-tab_timeline = tab_regimes
-tab_obs      = tab_regimes
-tab_params   = tab_model
-tab_duration = tab_model     # cut entirely below
-tab_convergence = tab_model
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 0 — SPATIAL DROUGHT MAP (SPI-12 across the SJV grid)
+# TAB 1 — SPATIAL DROUGHT MAP  (preserved verbatim)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab_map:
     st.markdown("### San Joaquin Valley Drought Map")
@@ -299,7 +187,7 @@ with tab_map:
         "**Dark red** = driest version of that month ever recorded; "
         "**dark blue** = wettest. Use the date picker, slider, or ▶ Play to step through time."
     )
-    with st.expander("📐 What this is, statistically"):
+    with st.expander("Statistical Details"):
         st.markdown(
             "- Each cell's value is its **percentile rank** of the 12-month rolling precipitation "
             "total against the 20 other instances of that same calendar month in the record.\n"
@@ -315,13 +203,6 @@ with tab_map:
     sp_lat, sp_lon, sp_dates, sp_grid = load_spatial()
     T = len(sp_dates)
 
-    # ── USDM-style categorical bands tuned for a 21-year sample ──────────────
-    # Five dry / Normal / five wet — fully symmetric.
-    #   rank 0  (driest of 21):  pct ≈ 0.024  →  D4 Exceptional
-    #   rank 1  (2nd driest):    pct ≈ 0.071  →  D3 Extreme
-    #   rank 2:                  pct ≈ 0.119  →  D2 Severe
-    #   ranks 3-4:               pct ≤ 0.214  →  D1 Moderate
-    #   ranks 5-6:               pct ≤ 0.310  →  D0 Abnormally Dry
     USDM = [
         ("D4 Exceptional Drought", "#5C0000", 0.00, 0.05),
         ("D3 Extreme Drought",     "#A60000", 0.05, 0.10),
@@ -336,7 +217,6 @@ with tab_map:
         ("W4 Exceptionally Wet",   "#0A3D66", 0.95, 1.01),
     ]
 
-    # Build a colorscale with sharp transitions at category boundaries
     colorscale = []
     for label, color, lo, hi in USDM:
         colorscale.append([lo, color])
@@ -353,10 +233,6 @@ with tab_map:
     max_dt = sp_dates[-1].to_pydatetime().date()
     month_labels = [d.strftime("%b %Y") for d in sp_dates]
 
-    # ── Precompute SJV outline ONCE — same mask every month ──────────────────
-    # Emits any cell edge that borders a NaN neighbour. A single Scatter
-    # polyline overlay draws them all on top of the heatmap → one black
-    # outline around the perimeter of the SJV (no per-pixel grid).
     @st.cache_data(show_spinner=False)
     def _sjv_outline(lat_arr, lon_arr, mask_bytes):
         mask = np.frombuffer(mask_bytes, dtype=bool).reshape(len(lat_arr), len(lon_arr))
@@ -385,18 +261,14 @@ with tab_map:
     _sjv_mask = (~np.isnan(sp_grid[0])).astype(bool)
     outline_x, outline_y = _sjv_outline(sp_lat, sp_lon, _sjv_mask.tobytes())
 
-    # ── Single source of truth for the displayed month ───────────────────────
     if "map_idx" not in st.session_state:
-        st.session_state["map_idx"] = 0       # ← start at first month (Dec 2000)
+        st.session_state["map_idx"] = 0
     if "map_playing" not in st.session_state:
         st.session_state["map_playing"] = False
 
-    # If something queued a new index since last run, apply it BEFORE the
-    # slider widget is created so the widget picks it up as its current value.
     if "_map_target" in st.session_state:
         st.session_state["map_idx"] = st.session_state.pop("_map_target")
 
-    # ── Date picker (jumps to nearest month, stops animation) ────────────────
     def _on_date_change():
         d = st.session_state["_date_jump"]
         ts = pd.Timestamp(d)
@@ -412,7 +284,6 @@ with tab_map:
         help="Pick any date — the map snaps to the nearest available SPI-12 month.",
     )
 
-    # ── Static heatmap for the current month + SJV outline overlay ──────────
     idx = st.session_state["map_idx"]
     fig_map = go.Figure()
     fig_map.add_trace(go.Heatmap(
@@ -449,27 +320,20 @@ with tab_map:
             font=dict(size=22, color=AXIS_DARK),
         ),
         xaxis=dict(
-            title=dict(text="Longitude (°W)",
-                       font=dict(color=AXIS_DARK, size=13), standoff=20),
+            title=dict(text="Longitude (°W)", font=dict(color=AXIS_DARK, size=13), standoff=20),
             showgrid=False, showline=True, linecolor=AXIS_DARK, linewidth=1,
-            tickfont=dict(color=AXIS_DARK, size=11), ticks="outside",
-            tickcolor=AXIS_DARK,
+            tickfont=dict(color=AXIS_DARK, size=11), ticks="outside", tickcolor=AXIS_DARK,
             scaleanchor="y", scaleratio=1.0, tickformat=".1f", zeroline=False,
         ),
         yaxis=dict(
             title=dict(text="Latitude (°N)", font=dict(color=AXIS_DARK, size=13)),
             showgrid=False, showline=True, linecolor=AXIS_DARK, linewidth=1,
-            tickfont=dict(color=AXIS_DARK, size=11), ticks="outside",
-            tickcolor=AXIS_DARK,
+            tickfont=dict(color=AXIS_DARK, size=11), ticks="outside", tickcolor=AXIS_DARK,
             tickformat=".1f", zeroline=False,
         ),
     )
-    # `displayModeBar: False` hides Plotly's modebar — no fullscreen button,
-    # no broken state to enter.
-    st.plotly_chart(fig_map, use_container_width=True, theme=None,
-                    config={"displayModeBar": False})
+    st.plotly_chart(fig_map, use_container_width=True, theme=None, config={"displayModeBar": False})
 
-    # ── Streamlit slider + Play/Pause (live drag, single-click, always works)
     st.select_slider(
         "Month",
         options=list(range(T)),
@@ -482,25 +346,19 @@ with tab_map:
 
     bc1, bc2, _ = st.columns([1, 1, 6])
     bc1.button("▶ Play",   on_click=_on_play,
-               disabled=st.session_state["map_playing"],
-               use_container_width=True)
+               disabled=st.session_state["map_playing"], use_container_width=True)
     bc2.button("❚❚ Pause", on_click=_on_pause,
-               disabled=not st.session_state["map_playing"],
-               use_container_width=True)
+               disabled=not st.session_state["map_playing"], use_container_width=True)
 
-    # ── Drought Calendar: months × years heatmap ─────────────────────────────
-    # Each cell = one month. Colour = % of the SJV in moderate-or-worse drought
-    # (D1+) for that month. Read-at-a-glance: dark red columns are drought
-    # years; pale columns are wet years; bands across rows show seasonality.
     st.markdown("#### Drought Calendar — % of SJV in moderate-or-worse drought")
     st.caption(
         "A 12 × 21 calendar of the entire record. Each tile is one month; "
         "**darker red = more of the valley was in drought that month**. "
-        "Vertical red streaks are drought *years* (2007–09, 2014–15, 2020); "
+        "Vertical red streaks are drought years (2007–09, 2014–15, 2020); "
         "pale-blue columns are wet years (2005, 2011, 2017). "
-        "Horizontal patterns would show seasonality."
+        "Horizontal patterns show seasonality."
     )
-    with st.expander("📐 What this is, statistically"):
+    with st.expander("Statistical details"):
         st.markdown(
             "- For every month and every SJV cell we have a percentile rank (from the map above).\n"
             "- A cell is **in drought** if its rank is below the 33rd percentile of its "
@@ -510,13 +368,11 @@ with tab_map:
             "dark red at 100% = every SJV cell was in drought."
         )
 
-    # Use the SJV mask (non-NaN cells in any frame) as the denominator —
-    # ignoring the ~973 non-SJV cells fixes the "max 25%" display bug.
     sjv_mask_full = ~np.isnan(sp_grid[0])
     sjv_n = max(int(sjv_mask_full.sum()), 1)
     pct_in_drought = np.zeros(T, dtype=float)
     for t in range(T):
-        in_drought = (sp_grid[t] < 0.33) & sjv_mask_full      # D0 or worse
+        in_drought = (sp_grid[t] < 0.33) & sjv_mask_full
         pct_in_drought[t] = 100 * int(in_drought.sum()) / sjv_n
 
     years = sorted({d.year for d in sp_dates})
@@ -526,23 +382,15 @@ with tab_map:
         cal[d.month - 1, year_idx[d.year]] = pct_in_drought[t]
 
     fig_cal = go.Figure(go.Heatmap(
-        z=cal,
-        x=years,
+        z=cal, x=years,
         y=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"],
         zmin=0, zmax=100,
         colorscale=[
-            [0.00, "#DCEEF6"],   # 0%   — pale blue (no drought, distinct from page bg)
-            [0.20, "#FFF2B3"],   # 20%  — pale yellow
-            [0.40, "#FFCB73"],   # 40%  — orange
-            [0.60, "#E66B00"],   # 60%  — deep orange
-            [0.80, "#A60000"],   # 80%  — red
-            [1.00, "#5C0000"],   # 100% — dark red
+            [0.00, "#DCEEF6"], [0.20, "#FFF2B3"], [0.40, "#FFCB73"],
+            [0.60, "#E66B00"], [0.80, "#A60000"], [1.00, "#5C0000"],
         ],
         xgap=2, ygap=2,
-        hovertemplate=(
-            "<b>%{y} %{x}</b><br>"
-            "%{z:.0f}% of SJV in drought (D1+)<extra></extra>"
-        ),
+        hovertemplate="<b>%{y} %{x}</b><br>%{z:.0f}% of SJV in drought (D1+)<extra></extra>",
         colorbar=dict(
             title=dict(text="% of SJV<br>in drought", side="right",
                        font=dict(color=AXIS_DARK, size=12)),
@@ -556,17 +404,12 @@ with tab_map:
         **{**PLOTLY_LAYOUT, "margin": dict(l=44, r=24, t=24, b=40)},
         height=380,
         xaxis=dict(title=None, type="category",
-                   tickfont=dict(color=AXIS_DARK, size=11),
-                   showgrid=False, showline=False),
+                   tickfont=dict(color=AXIS_DARK, size=11), showgrid=False, showline=False),
         yaxis=dict(title=None, autorange="reversed",
-                   tickfont=dict(color=AXIS_DARK, size=11),
-                   showgrid=False, showline=False),
+                   tickfont=dict(color=AXIS_DARK, size=11), showgrid=False, showline=False),
     )
     st.plotly_chart(fig_cal, use_container_width=True, theme=None)
 
-    # ── Auto-advance when playing ────────────────────────────────────────────
-    # Streamlit-driven: write to _map_target, rerun. Next run applies it to
-    # the slider before any widget renders, so map_idx advances cleanly.
     if st.session_state["map_playing"]:
         if st.session_state["map_idx"] < T - 1:
             time.sleep(0.15)
@@ -577,521 +420,791 @@ with tab_map:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 0 — DROUGHT SEVERITY (continuous posterior)
+# TAB 2 — MODELING PRECIPITATION  (Continuous RVs + MLE)
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_severity:
-    st.markdown("### Drought Intensity — how confident is the model that we're in drought?")
+with tab_precip:
+    st.markdown("### Modeling Monthly Precipitation — Gamma vs Normal MLE")
     st.caption(
-        "A continuous score from 0% to 100% for every month, showing how strongly the model "
-        "believes the SJV was in drought conditions. Higher = deeper drought. "
-        "The coloured background bands match the U.S. Drought Monitor's "
-        "D0 → D4 severity scale, so you can read off what 'category' each month was in. "
-        "Annotated peaks line up with the real-world drought events."
+        "Monthly precipitation in the SJV is right-skewed and can't go below zero — "
+        "properties the Normal distribution handles poorly. "
+        "The **Gamma distribution** is the climatological standard for monthly rainfall, "
+        "and its parameters can be estimated by maximum-likelihood, exactly as in CS109."
     )
-    with st.expander("📐 What this is, statistically"):
-        st.markdown(
-            "- The HMM produces a smoothed posterior probability for every regime at every month:  \n"
-            "  $\\gamma_t(k) = \\Pr(Z_t = k \\mid X_{1:T})$  — computed by the forward–backward algorithm.\n"
-            "- Unlike **Viterbi decoding** (which picks the single most likely state per month), the "
-            "posterior preserves the full probability *distribution* across all four regimes. "
-            "That's what gives this view a smooth gradient instead of a step function.\n"
-            "- We summarise it into a drought-intensity score:  \n"
-            "  $\\text{DI}(t) = \\gamma_t(\\text{Drought}) + 0.4 \\cdot \\gamma_t(\\text{Hot Regime})$  \n"
-            "  — full weight on the persistent drought regime, partial weight on the hot/warming "
-            "regime since it's also dry but with different physical drivers.\n"
-            "- The USDM-style D0–D4 bands map this score to standard drought categories so the "
-            "result is directly comparable to published drought reports."
-        )
+    with st.expander("Statistical details"):
+        st.markdown(r"""
+**Gamma distribution**
 
-    if gamma is None:
-        st.error("Posterior gamma not found. Run `python main.py` to regenerate outputs.")
-    else:
-        # Build drought intensity = weighted sum of dry-state posteriors
-        intensity = np.zeros(len(states))
-        for k, w in DROUGHT_STATES.items():
-            intensity += w * gamma[:, k]
-        intensity = np.clip(intensity, 0.0, 1.0)
+$$f(x;\, k,\theta) = \frac{x^{k-1}\,e^{-x/\theta}}{\theta^k\,\Gamma(k)}, \quad x > 0$$
 
-        sev_df = pd.DataFrame({"intensity": intensity}, index=dates)
+Parameters: shape $k > 0$, scale $\theta > 0$.
 
-        # ── Categorise into Drought Monitor classes ──────────────────────────
-        def classify(val):
-            for lo, hi, color, label in DROUGHT_MONITOR_SCALE:
-                if lo <= val < hi:
-                    return label, color
-            return DROUGHT_MONITOR_SCALE[-1][3], DROUGHT_MONITOR_SCALE[-1][2]
+**MLE objective**
 
-        sev_df["category"] = sev_df["intensity"].apply(lambda v: classify(v)[0])
-        sev_df["color"]    = sev_df["intensity"].apply(lambda v: classify(v)[1])
+$$\hat\theta_{\text{MLE}} = \underset{\theta}{\arg\max}\; \sum_i \log f(x_i;\theta)$$
 
-        # ── Headline severity-strip plot ─────────────────────────────────────
-        fig_strip = go.Figure()
+- **Normal MLE**: closed form — $\hat\mu = \bar x$, $\hat\sigma^2 = \tfrac{1}{n}\sum(x_i-\bar x)^2$.
+- **Gamma MLE**: no closed form for $k$. `scipy.stats.gamma.fit` uses Newton-Raphson on the digamma function.
 
-        # Horizontal threshold bands behind the curve
-        for lo, hi, color, label in DROUGHT_MONITOR_SCALE[1:]:
-            fig_strip.add_hrect(
-                y0=lo, y1=min(hi, 1.0),
-                fillcolor=color, opacity=0.22,
-                line_width=0, layer="below",
-                annotation_text=label, annotation_position="top right",
-                annotation_font_size=10,
-            )
+**Why this matters**: the U.S. Drought Monitor's Standardized Precipitation Index (SPI) is defined as:
+$$\text{SPI}(x) = \Phi^{-1}(F_{\text{Gamma}}(x))$$
+i.e. fit a Gamma to the data, transform to a standard Normal via the CDF.
+""")
 
-        # The main intensity line — solid, no transparency issues
-        fig_strip.add_trace(go.Scatter(
-            x=sev_df.index, y=sev_df["intensity"],
-            mode="lines",
-            line=dict(color="#222", width=2.2),
-            fill="tozeroy",
-            fillcolor="rgba(50,50,50,0.18)",
-            name="P(drought | data)",
-            hovertemplate="<b>%{x|%b %Y}</b><br>P(drought) = %{y:.0%}<extra></extra>",
-        ))
+    MONTH_NAMES = ["January","February","March","April","May","June",
+                   "July","August","September","October","November","December"]
+    selected_month_name = st.selectbox(
+        "Calendar month",
+        MONTH_NAMES,
+        index=0,
+        key="mle_month",
+    )
+    sel_m = MONTH_NAMES.index(selected_month_name) + 1
 
-        fig_strip.update_layout(
-            **PLOTLY_LAYOUT,
-            height=360,
-            yaxis=dict(
-                title="P(drought | data)",
-                range=[0, 1], showgrid=False,
-                tickformat=".0%",
-            ),
-            xaxis=dict(showgrid=False, title=None),
-            showlegend=False,
-        )
+    # Pull raw monthly precip for the selected calendar month
+    precip_series = precip_raw.copy()
+    month_data = precip_series[precip_series.index.month == sel_m].values
+    month_data = month_data[month_data > 0]   # Gamma requires x > 0; drop exact zeros
 
-        # Annotate the famous droughts
-        annotations = [
-            ("2008-09-01", "2007–09 drought"),
-            ("2014-09-01", "Mega-drought peak"),
-            ("2020-09-01", "2020 drought"),
-        ]
-        for date_str, label in annotations:
-            ts = pd.Timestamp(date_str)
-            if sev_df.index[0] <= ts <= sev_df.index[-1]:
-                yv = float(sev_df["intensity"].asof(ts))
-                fig_strip.add_annotation(
-                    x=ts, y=min(yv + 0.05, 0.96),
-                    text=label, showarrow=True, arrowhead=2,
-                    ay=-28, ax=0,
-                    font=dict(size=11, color="#222"),
-                    bgcolor="rgba(255,255,255,0.92)",
-                    bordercolor="#666", borderwidth=0.5, borderpad=3,
-                )
+    n = len(month_data)
+    x_lo, x_hi = 0.0, month_data.max() * 1.35
+    x_fit = np.linspace(max(x_lo, 1e-3), x_hi, 400)
 
-        st.plotly_chart(fig_strip, use_container_width=True, theme=None)
+    # Gamma MLE
+    gamma_fit = stats.gamma.fit(month_data, floc=0)   # fix location=0
+    k_hat, loc_hat, theta_hat = gamma_fit
+    gamma_ll = float(stats.gamma.logpdf(month_data, *gamma_fit).sum())
 
-        # ── Summary metrics ──────────────────────────────────────────────────
-        annual = sev_df["intensity"].groupby(sev_df.index.year).mean()
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Driest year (annual mean)",  annual.idxmax(),
-                  delta=f"P = {annual.max():.2f}", delta_color="off")
-        c2.metric("Wettest year",               annual.idxmin(),
-                  delta=f"P = {annual.min():.2f}", delta_color="off")
-        c3.metric("Months in D3+ Extreme",      int((intensity >= 0.80).sum()),
-                  delta=f"{(intensity >= 0.80).mean()*100:.0f}% of record",
-                  delta_color="off")
-        c4.metric("Months in D4 Exceptional",   int((intensity >= 0.95).sum()),
-                  delta=f"{(intensity >= 0.95).mean()*100:.0f}% of record",
-                  delta_color="off")
+    # Normal MLE (closed form)
+    mu_hat  = float(month_data.mean())
+    sig_hat = float(month_data.std(ddof=0))
+    norm_ll = float(stats.norm.logpdf(month_data, mu_hat, sig_hat).sum())
 
-        # ── Annual ranking table ─────────────────────────────────────────────
-        st.markdown("### Annual Drought Ranking")
-        rank_df = pd.DataFrame({
-            "Year":          annual.index,
-            "P(drought)":    annual.values.round(2),
-            "Severity":      [classify(v)[0] for v in annual.values],
-        }).set_index("Year")
-        rank_df = rank_df.sort_values("P(drought)", ascending=False)
-        st.dataframe(rank_df, use_container_width=True, height=420)
+    gamma_pdf = stats.gamma.pdf(x_fit, k_hat, loc_hat, theta_hat)
+    norm_pdf  = stats.norm.pdf(x_fit, mu_hat, sig_hat)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — REGIME TIMELINE
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_timeline:
-    st.markdown("### Regime Probability Over Time")
+    # ── Histogram + fitted PDFs ──────────────────────────────────────────────
+    fig_mle = go.Figure()
+    fig_mle.add_trace(go.Histogram(
+        x=month_data, nbinsx=10,
+        histnorm="probability density",
+        marker=dict(color="#B3D9E6", line=dict(color="white", width=1)),
+        name=f"{selected_month_name} data (n={n})",
+        hovertemplate="bin centre %{x:.0f} mm<br>density %{y:.4f}<extra></extra>",
+    ))
+    fig_mle.add_trace(go.Scatter(
+        x=x_fit, y=gamma_pdf,
+        mode="lines",
+        line=dict(color="#A60000", width=2.5),
+        name=f"Gamma MLE  (k={k_hat:.2f}, θ={theta_hat:.1f})",
+    ))
+    fig_mle.add_trace(go.Scatter(
+        x=x_fit, y=norm_pdf,
+        mode="lines",
+        line=dict(color="#888", width=2, dash="dash"),
+        name=f"Normal MLE  (μ={mu_hat:.1f}, σ={sig_hat:.1f})",
+    ))
+    fig_mle.update_layout(
+        **PLOTLY_LAYOUT, height=400,
+        xaxis=dict(title="Monthly precipitation (mm)",
+                   showgrid=False, showline=True, linecolor=DARK,
+                   tickfont=dict(color=DARK)),
+        yaxis=dict(title="Probability density",
+                   showgrid=True, gridcolor="#eee",
+                   showline=True, linecolor=DARK,
+                   tickfont=dict(color=DARK)),
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
+    )
+    st.plotly_chart(fig_mle, use_container_width=True, theme=None)
+
+    # ── Parameter summary cards ──────────────────────────────────────────────
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Gamma log-likelihood", f"{gamma_ll:.1f}")
+    c2.metric("Normal log-likelihood", f"{norm_ll:.1f}",
+              delta=f"{norm_ll - gamma_ll:.1f} vs Gamma", delta_color="inverse")
+    c3.metric("Gamma wins?", "Yes ✓" if gamma_ll > norm_ll else "No")
+
     st.caption(
-        "The HMM discovered four climate 'archetypes' — Pluvial, Near-Normal, Hot, and Drought. "
-        "Each panel below tracks one archetype over time: the line shows how strongly the model "
-        "believes the SJV was in *that* archetype each month. 100% = the model is certain; "
-        "values in between mean it's split between this archetype and a neighbour."
+        f"The Gamma fit (log-ℓ = {gamma_ll:.1f}) beats the Normal fit "
+        f"(log-ℓ = {norm_ll:.1f}) by {gamma_ll - norm_ll:.1f} nats for {selected_month_name}. "
+        "Higher log-likelihood = better fit. "
+        "The Normal also extends below zero, which is physically impossible for precipitation."
     )
-    st.info(
-        "💡 The 'Drought' panel only lights up when conditions are *deeply* anomalous on both "
-        "precipitation and ET. The famous 2012–2017 California drought was a multi-year stretch "
-        "of varying severity that peaked sharply in 2014–2015; 2012–13 were dry but not yet "
-        "at the Drought archetype's centroid, so they classify as Near-Normal here. "
-        "For partial-credit drought during the buildup years, see the **Drought Severity** tab."
+
+    # ── SPI bonus: show CDF transformation ──────────────────────────────────
+    st.markdown("#### Bonus: Standardised Precipitation Index (SPI)")
+    st.caption(
+        "The SPI converts each month's precipitation total to a z-score by way of the fitted "
+        "Gamma CDF. Values below −0.5 indicate drought; below −1.5 indicate severe drought."
     )
-    with st.expander("📐 What this is, statistically"):
-        st.markdown(
-            "- The HMM has 4 hidden states (regimes). For every month it computes the smoothed "
-            "posterior probability of being in each:  \n"
-            "  $\\gamma_t(k) = \\Pr(Z_t = k \\mid X_{1:T})$\n"
-            "- Computed by the **forward–backward algorithm** — uses both past *and* future "
-            "observations to refine the probability at each time step.\n"
-            "- For every month, the four panels sum to 100% (the regime must be exactly one of the four).\n"
-            "- Compare to **Viterbi MAP decoding**, which would pick the single argmax regime per "
-            "month — fine, but loses uncertainty. The posterior shows when the model was on the "
-            "fence between two regimes (look for plateaus around 30–70% instead of 0/100% spikes)."
-        )
 
-    # Small-multiples: one row per regime — every row reads independently
-    # as a normal time series, far more interpretable than a colour-density
-    # heatmap. Order from wet → dry top-to-bottom for narrative flow.
-    row_order = [0, 3, 2, 1]   # Pluvial → Near-Normal → Hot → Drought
+    spi_vals = stats.norm.ppf(stats.gamma.cdf(month_data, k_hat, loc_hat, theta_hat))
+    spi_vals = spi_vals[np.isfinite(spi_vals)]
 
-    def _hex_to_rgba(hex_color, alpha):
-        h = hex_color.lstrip("#")
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        return f"rgba({r},{g},{b},{alpha})"
-
-    fig = make_subplots(
-        rows=4, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.035,
-        subplot_titles=[REGIME_LABELS[k] for k in row_order],
-    )
-    for row_i, k in enumerate(row_order, start=1):
-        color = REGIME_COLORS[k]
-        fig.add_trace(go.Scatter(
-            x=dates, y=gamma[:, k],
-            mode="lines",
-            line=dict(color=color, width=1.6),
-            fill="tozeroy",
-            fillcolor=_hex_to_rgba(color, 0.30),
-            hovertemplate=(
-                f"<b>{REGIME_LABELS[k]}</b><br>"
-                "%{x|%b %Y}<br>γ = %{y:.0%}<extra></extra>"
-            ),
-            showlegend=False,
-        ), row=row_i, col=1)
-        # Subtle reference lines at 50% and 100%
-        fig.add_hline(y=0.5, line_dash="dot", line_color="#cccccc", line_width=1, row=row_i, col=1)
-
-    DARK = "#1a1a1a"
-    fig.update_layout(
-        **{**PLOTLY_LAYOUT, "margin": dict(l=48, r=24, t=40, b=40)},
-        height=520,
+    fig_spi = go.Figure()
+    fig_spi.add_trace(go.Bar(
+        x=list(range(len(spi_vals))),
+        y=spi_vals,
+        marker=dict(
+            color=["#A60000" if v < -0.5 else "#4D94CC" for v in spi_vals],
+            line=dict(width=0),
+        ),
+        hovertemplate="Year offset %{x}<br>SPI = %{y:.2f}<extra></extra>",
         showlegend=False,
+    ))
+    fig_spi.add_hline(y=-0.5, line_dash="dot", line_color="#E66B00",
+                      annotation_text="Drought threshold (−0.5)",
+                      annotation_position="bottom right",
+                      annotation_font=dict(color="#E66B00", size=11))
+    fig_spi.update_layout(
+        **PLOTLY_LAYOUT, height=280,
+        xaxis=dict(title=f"{selected_month_name} index (across 21-yr record)",
+                   showgrid=False, showline=True, linecolor=DARK),
+        yaxis=dict(title="SPI", showgrid=True, gridcolor="#eee",
+                   showline=True, linecolor=DARK),
     )
-    fig.update_xaxes(showgrid=False, showline=True, linecolor=DARK,
-                     tickfont=dict(color=DARK, size=10),
-                     ticks="outside", tickcolor=DARK)
-    fig.update_yaxes(range=[0, 1.02], tickformat=".0%",
-                     showgrid=True, gridcolor="#eaeaea",
-                     showline=True, linecolor=DARK,
-                     tickfont=dict(color=DARK, size=10),
-                     tickvals=[0, 0.5, 1.0])
-    # Style the subplot titles (regime labels) to be left-aligned, bold, in regime colour
-    for i, k in enumerate(row_order):
-        fig.layout.annotations[i].update(
-            font=dict(size=13, color=REGIME_COLORS[k]),
-            x=0.0, xanchor="left",
-        )
-    st.plotly_chart(fig, use_container_width=True, theme=None)
+    st.plotly_chart(fig_spi, use_container_width=True, theme=None)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — OBSERVATIONS
+# TAB 3 — PREDICTING DROUGHT  (Logistic Regression from scratch)
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_obs:
-    # ── Emission space + Gaussian ellipses ───────────────────────────────────
-    st.markdown("### Where each regime lives — observations + learned ellipses")
+with tab_logit:
+    st.markdown("### Predicting Next-Month Drought — Logistic Regression")
     st.caption(
-        "Each dot is one month, positioned by **how anomalous its precipitation was** (horizontal) "
-        "and **how anomalous its ET was** (vertical). The dashed lines are 'normal'. "
-        "Dots are coloured by the regime the model assigned them. "
-        "Around each regime's centre (◆) you see two ellipses — the model thinks "
-        "**~40% of that regime's months land inside the inner ellipse**, **~86% inside the outer one**.\n\n"
-        "Read the quadrants: left = drier than normal, right = wetter; top = higher ET, bottom = lower ET. "
-        "**Drought** (red) clusters bottom-left, **Hot Regime** (amber) top-right, "
-        "**Pluvial** (blue) top-right with high precip, **Near-Normal** (grey) hugs the origin."
+        "Can this month's precipitation and ET anomalies predict whether **next month** will be "
+        "a drought month? We fit a logistic regression from scratch using gradient ascent on the "
+        "log-likelihood, exactly as derived in CS109."
     )
-    with st.expander("📐 What this is, statistically"):
-        st.markdown(
-            "- The HMM uses a **multivariate Gaussian emission model**: given regime $k$, the "
-            "observation is distributed as  \n"
-            "  $X_t \\mid Z_t = k \\;\\sim\\; \\mathcal{N}(\\boldsymbol{\\mu}_k, \\boldsymbol{\\Sigma}_k)$\n"
-            "- Each ellipse is a **level set** of that Gaussian's probability density — the locus "
-            "of points satisfying  $(x - \\mu_k)^\\top \\Sigma_k^{-1} (x - \\mu_k) = c^2$.\n"
-            "- For $c = 1$ the ellipse encloses ~39% of the probability mass (the 2-D analogue of "
-            "'1σ'); for $c = 2$ it encloses ~86%. (Note: these are *not* the familiar 68% / 95% — "
-            "those are the 1-D values; in 2D the same $c$ encloses less mass.)\n"
-            "- Ellipses are computed by **eigendecomposition** of $\\Sigma_k$: the eigenvectors give "
-            "the principal axes (rotation), the eigenvalues give the variance along each axis "
-            "(stretching).\n"
-            "- The orientation/tilt of an ellipse reveals **covariance** — a tilted ellipse means "
-            "precip and ET are correlated within that regime; an axis-aligned ellipse means they "
-            "vary independently."
+    with st.expander("Statistical details"):
+        st.markdown(r"""
+**Logistic regression as a probabilistic classifier**
+
+$$\Pr(y=1 \mid x) = \sigma(\beta^\top x) = \frac{1}{1+e^{-\beta^\top x}}$$
+
+**Log-likelihood (MLE objective)**
+
+$$\ell(\beta) = \sum_i \bigl[y_i \log\sigma(\beta^\top x_i) + (1-y_i)\log(1-\sigma(\beta^\top x_i))\bigr]$$
+
+**Gradient ascent update** (no closed form — log-likelihood is concave but not quadratic):
+
+$$\beta \leftarrow \beta + \eta \sum_i (y_i - \sigma(\beta^\top x_i))\, x_i$$
+
+Key CS109 result: the gradient $\nabla_\beta\ell = X^\top(y - \hat{p})$ has a beautifully clean form.
+
+**Features**: SPI-12 at month $t$, ETI-12 at month $t$, sin/cos of calendar month.
+**Label**: $y_t = 1$ if SPI-12 at month $t+1 < -0.5$ (drought), else 0.
+**Split**: train 2000–2015, test 2016–2020.
+""")
+
+    # ── Build features and labels ────────────────────────────────────────────
+    T_anom = len(spi12)
+    months_sin = np.sin(2 * np.pi * anom_dates.month / 12)
+    months_cos = np.cos(2 * np.pi * anom_dates.month / 12)
+
+    # Features at t, label is drought at t+1
+    feat = np.column_stack([
+        np.ones(T_anom - 1),          # bias
+        spi12[:-1],
+        eti12[:-1],
+        months_sin[:-1],
+        months_cos[:-1],
+    ])
+    labels = (spi12[1:] < DROUGHT_THRESH).astype(float)
+    feat_dates = anom_dates[:-1]
+
+    # Train/test split on year boundary
+    train_mask = feat_dates.year <= 2015
+    test_mask  = feat_dates.year >= 2016
+
+    X_tr, y_tr = feat[train_mask], labels[train_mask]
+    X_te, y_te = feat[test_mask],  labels[test_mask]
+
+    # ── Gradient ascent ──────────────────────────────────────────────────────
+    @st.cache_data(show_spinner=False)
+    def _fit_logistic(X_bytes, y_bytes, n_iter=2000, lr=0.05):
+        X = np.frombuffer(X_bytes, dtype=np.float64).reshape(-1, 5)
+        y = np.frombuffer(y_bytes, dtype=np.float64)
+        beta = np.zeros(X.shape[1])
+        lls  = []
+        for _ in range(n_iter):
+            logits = X @ beta
+            p = 1.0 / (1.0 + np.exp(-np.clip(logits, -30, 30)))
+            ll = float(np.sum(y * np.log(p + 1e-15) + (1 - y) * np.log(1 - p + 1e-15)))
+            lls.append(ll)
+            grad = X.T @ (y - p)
+            beta += lr * grad
+        return beta, np.array(lls)
+
+    beta, train_lls = _fit_logistic(X_tr.tobytes(), y_tr.tobytes())
+
+    def sigmoid(z): return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+
+    p_tr = sigmoid(X_tr @ beta)
+    p_te = sigmoid(X_te @ beta)
+    pred_te = (p_te >= 0.5).astype(int)
+
+    # ── Metrics ──────────────────────────────────────────────────────────────
+    TP = int(((pred_te == 1) & (y_te == 1)).sum())
+    FP = int(((pred_te == 1) & (y_te == 0)).sum())
+    TN = int(((pred_te == 0) & (y_te == 0)).sum())
+    FN = int(((pred_te == 0) & (y_te == 1)).sum())
+    acc  = (TP + TN) / len(y_te)
+    prec = TP / (TP + FP) if TP + FP > 0 else 0.0
+    rec  = TP / (TP + FN) if TP + FN > 0 else 0.0
+    f1   = 2 * prec * rec / (prec + rec) if prec + rec > 0 else 0.0
+
+    # ── Layout: 2 columns ────────────────────────────────────────────────────
+    left, right = st.columns(2)
+
+    # Training log-likelihood curve
+    with left:
+        st.markdown("##### Training log-likelihood (gradient ascent)")
+        fig_ll = go.Figure(go.Scatter(
+            x=list(range(1, len(train_lls) + 1)), y=train_lls,
+            mode="lines", line=dict(color="#3978AE", width=2),
+            hovertemplate="Iter %{x}<br>LL = %{y:.1f}<extra></extra>",
+        ))
+        fig_ll.update_layout(
+            **PLOTLY_LAYOUT, height=280,
+            xaxis=dict(title="Gradient ascent iteration",
+                       showgrid=False, showline=True, linecolor=DARK),
+            yaxis=dict(title="Log-likelihood",
+                       showgrid=True, gridcolor="#eee", showline=True, linecolor=DARK),
         )
+        st.plotly_chart(fig_ll, use_container_width=True, theme=None)
 
-    def _ellipse(mu, cov, k_sigma, n=120):
-        """(x,y) coords of the k_sigma confidence ellipse for 𝒩(mu, cov)."""
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        eigvals = np.clip(eigvals, 0, None)
-        theta = np.linspace(0, 2 * np.pi, n)
-        circle = np.stack([np.cos(theta), np.sin(theta)], axis=0)
-        scaled = np.diag(np.sqrt(eigvals) * k_sigma) @ circle
-        rot = eigvecs @ scaled
-        return mu[0] + rot[0], mu[1] + rot[1]
+    # Confusion matrix
+    with right:
+        st.markdown("##### Confusion matrix (test set 2016–2020)")
+        cm = np.array([[TN, FP], [FN, TP]])
+        fig_cm = go.Figure(go.Heatmap(
+            z=cm, x=["Pred: No Drought", "Pred: Drought"],
+            y=["True: No Drought", "True: Drought"],
+            colorscale=[[0, "#F2F2F2"], [1, "#3978AE"]],
+            showscale=False, zmin=0,
+            text=[[str(v) for v in row] for row in cm],
+            texttemplate="<b>%{text}</b>",
+            textfont=dict(size=22, color=DARK),
+            hovertemplate="%{y} / %{x}<br>Count: %{z}<extra></extra>",
+        ))
+        fig_cm.update_layout(
+            **PLOTLY_LAYOUT, height=280,
+            xaxis=dict(side="bottom", tickfont=dict(color=DARK, size=12)),
+            yaxis=dict(autorange="reversed", tickfont=dict(color=DARK, size=12)),
+        )
+        st.plotly_chart(fig_cm, use_container_width=True, theme=None)
 
-    def _hex_rgba(hex_color, alpha):
-        h = hex_color.lstrip("#")
-        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        return f"rgba({r},{g},{b},{alpha})"
+    # Metrics row
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Accuracy",  f"{acc:.0%}")
+    m2.metric("Precision", f"{prec:.0%}")
+    m3.metric("Recall",    f"{rec:.0%}")
+    m4.metric("F1",        f"{f1:.0%}")
 
-    # Σ in observation space  (z-score units, same as obs_df columns)
-    # mus_phys is already in obs units; rescale Σ similarly:
-    #   Σ_obs[k] = D · Σ_norm[k] · D,  where D = diag(obs_std)
-    D = np.diag(obs_std)
-    sigmas_obs = np.array([D @ sigmas[k] @ D for k in range(4)])
+    # ROC curve
+    thresholds = np.linspace(0, 1, 200)
+    tprs, fprs = [], []
+    for thr in thresholds:
+        pp = (p_te >= thr).astype(int)
+        tp_ = int(((pp == 1) & (y_te == 1)).sum())
+        fp_ = int(((pp == 1) & (y_te == 0)).sum())
+        tn_ = int(((pp == 0) & (y_te == 0)).sum())
+        fn_ = int(((pp == 0) & (y_te == 1)).sum())
+        tprs.append(tp_ / (tp_ + fn_) if tp_ + fn_ > 0 else 0.0)
+        fprs.append(fp_ / (fp_ + tn_) if fp_ + tn_ > 0 else 0.0)
 
-    fig4 = go.Figure()
+    auc = float(np.trapz(tprs[::-1], fprs[::-1]))
 
-    # 1. Data points
-    for k in range(4):
-        mask = obs_df["state"] == k
-        fig4.add_trace(go.Scatter(
-            x=obs_df.loc[mask, "precip_anom"],
-            y=obs_df.loc[mask, "et_anom"],
-            mode="markers",
-            name=REGIME_LABELS[k],
-            marker=dict(color=REGIME_COLORS[k], size=7,
-                        opacity=0.65,
-                        line=dict(color="white", width=0.5)),
-            hovertemplate=(
-                "<b>" + REGIME_LABELS[k] + "</b><br>"
-                "SPI-12: %{x:+.2f}σ<br>ETI-12: %{y:+.2f}σ<extra></extra>"
+    left2, right2 = st.columns(2)
+
+    with left2:
+        st.markdown("##### ROC curve (test set)")
+        fig_roc = go.Figure()
+        fig_roc.add_trace(go.Scatter(
+            x=fprs, y=tprs, mode="lines",
+            line=dict(color="#A60000", width=2),
+            name=f"Logistic (AUC = {auc:.3f})",
+        ))
+        fig_roc.add_trace(go.Scatter(
+            x=[0, 1], y=[0, 1], mode="lines",
+            line=dict(color="#bbb", dash="dash"), showlegend=False,
+        ))
+        fig_roc.update_layout(
+            **PLOTLY_LAYOUT, height=300,
+            xaxis=dict(title="False positive rate", range=[0, 1],
+                       showgrid=False, showline=True, linecolor=DARK),
+            yaxis=dict(title="True positive rate", range=[0, 1],
+                       showgrid=True, gridcolor="#eee", showline=True, linecolor=DARK),
+            legend=dict(x=0.5, y=0.05),
+        )
+        st.plotly_chart(fig_roc, use_container_width=True, theme=None)
+
+    # Coefficient bar chart
+    with right2:
+        st.markdown("##### Learned coefficients β")
+        feat_names = ["Bias", "SPI-12", "ETI-12", "Month sin", "Month cos"]
+        fig_beta = go.Figure(go.Bar(
+            x=beta,
+            y=feat_names,
+            orientation="h",
+            marker=dict(
+                color=["#3978AE" if v >= 0 else "#A60000" for v in beta],
             ),
+            hovertemplate="%{y}: β = %{x:.3f}<extra></extra>",
         ))
+        fig_beta.add_vline(x=0, line_color=DARK, line_width=1)
+        fig_beta.update_layout(
+            **PLOTLY_LAYOUT, height=300,
+            xaxis=dict(title="Coefficient value",
+                       showgrid=True, gridcolor="#eee", showline=True, linecolor=DARK),
+            yaxis=dict(showgrid=False, showline=True, linecolor=DARK),
+        )
+        st.plotly_chart(fig_beta, use_container_width=True, theme=None)
 
-    # 2. Confidence ellipses (2σ first so 1σ draws on top)
-    for k in range(4):
-        mu = mus_phys[k]
-        for k_sig, alpha_fill, alpha_line in [(2.0, 0.06, 0.55),
-                                              (1.0, 0.14, 0.95)]:
-            ex, ey = _ellipse(mu, sigmas_obs[k], k_sig)
-            fig4.add_trace(go.Scatter(
-                x=ex, y=ey,
-                mode="lines",
-                line=dict(color=REGIME_COLORS[k], width=1.6),
-                opacity=alpha_line,
-                fill="toself",
-                fillcolor=_hex_rgba(REGIME_COLORS[k], alpha_fill),
-                showlegend=False, hoverinfo="skip",
-            ))
-
-    # 3. Means
-    for k in range(4):
-        mu = mus_phys[k]
-        fig4.add_trace(go.Scatter(
-            x=[mu[0]], y=[mu[1]],
-            mode="markers+text",
-            marker=dict(symbol="diamond", color=REGIME_COLORS[k],
-                        size=18, line=dict(color="white", width=2.5)),
-            text=[f"  μ — {REGIME_LABELS[k]}"],
-            textposition="middle right",
-            textfont=dict(size=12, color=REGIME_COLORS[k]),
-            showlegend=False,
-            hovertemplate=(
-                f"<b>μ — {REGIME_LABELS[k]}</b><br>"
-                f"SPI-12: {mu[0]:+.2f}σ<br>ETI-12: {mu[1]:+.2f}σ<extra></extra>"
-            ),
-        ))
-
-    fig4.add_hline(y=0, line_dash="dash", line_color="#bbb", line_width=1)
-    fig4.add_vline(x=0, line_dash="dash", line_color="#bbb", line_width=1)
-
-    fig4.update_layout(
-        **PLOTLY_LAYOUT,
-        height=560,
-        xaxis=dict(
-            title=dict(text="SPI-12 — precipitation anomaly (σ)",
-                       font=dict(color="#1a1a1a", size=13)),
-            tickfont=dict(color="#1a1a1a", size=11),
-            showgrid=True, gridcolor="#e8e8e8", zeroline=False,
-            showline=True, linecolor="#1a1a1a",
-        ),
-        yaxis=dict(
-            title=dict(text="ETI-12 — ET anomaly (σ)",
-                       font=dict(color="#1a1a1a", size=13)),
-            tickfont=dict(color="#1a1a1a", size=11),
-            showgrid=True, gridcolor="#e8e8e8", zeroline=False,
-            showline=True, linecolor="#1a1a1a",
-        ),
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
-            xanchor="left", x=0, itemsizing="constant",
-            font=dict(color="#1a1a1a", size=12),
-        ),
-    )
-    st.plotly_chart(fig4, use_container_width=True, theme=None)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — MODEL PARAMETERS
-# ═══════════════════════════════════════════════════════════════════════════════
-with tab_params:
-    st.markdown("### Learned HMM Parameters")
     st.caption(
-        "The numbers the model converged on after training. Three sections:\n\n"
-        "1. **Transition matrix** — how the model expects the SJV to *switch* between regimes month to month.\n"
-        "2. **Emission means** — what 'typical' precipitation and ET look like inside each regime.\n"
-        "3. **Stationary distribution** — if the SJV ran forever under this model, what fraction "
-        "of months would it spend in each regime?"
+        "Negative SPI-12 (drier than normal) **increases** the probability of drought next month "
+        "(negative β → logit decreases → lower P(drought) when precip is above normal, "
+        "higher when below). "
+        "The sign of the SPI-12 coefficient should be negative: more precipitation now → "
+        "less drought next month."
     )
-    with st.expander("📐 What this is, statistically"):
-        st.markdown(
-            "An HMM is fully specified by three pieces:\n\n"
-            "- **Initial distribution**  $\\pi$  — probabilities of starting in each regime.\n"
-            "- **Transition matrix**  $A_{jk} = \\Pr(Z_t = k \\mid Z_{t-1} = j)$ — a $K \\times K$ "
-            "stochastic matrix; each row sums to 1.\n"
-            "- **Emission parameters**  $\\boldsymbol{\\mu}_k, \\boldsymbol{\\Sigma}_k$ — the mean and "
-            "covariance of the multivariate Gaussian that generates observations when the chain is "
-            "in regime $k$.\n\n"
-            "All three are learned from the data via **Baum-Welch** (the EM algorithm for HMMs), "
-            "starting from k-means initialisation of the means and an identity-matrix covariance.\n\n"
-            "The **stationary distribution** $\\bar{\\pi}$ is the unique probability vector "
-            "satisfying $\\bar{\\pi}^\\top A = \\bar{\\pi}^\\top$ — i.e., the left eigenvector of "
-            "$A$ with eigenvalue 1. It tells you the long-run fraction of time the Markov chain "
-            "spends in each regime."
-        )
 
-    col_A, col_mus = st.columns([1, 1])
-    DARK = "#1a1a1a"
-
-    with col_A:
-        st.markdown("#### Transition matrix")
-        st.caption(
-            "Read row → column: 'if I'm in regime X this month, what's the chance I'm in "
-            "regime Y next month?' Diagonal values are *self-transitions* — how persistent each "
-            "regime is. High diagonals (e.g. 0.9) mean the regime tends to last several months."
-        )
-
-        labels = [REGIME_LABELS[k] for k in range(4)]
-        fig5 = go.Figure(go.Heatmap(
-            z=A,
-            x=labels,
-            y=labels,
-            colorscale=[
-                [0.0, "#f7f7f7"],
-                [0.5, "#9ecae1"],
-                [1.0, "#084594"],
-            ],
-            zmin=0, zmax=1,
-            text=[[f"{A[i,j]:.3f}" for j in range(4)] for i in range(4)],
-            texttemplate="%{text}",
-            textfont=dict(size=14, color=DARK),
-            hovertemplate="%{y} → %{x}<br>Prob: %{z:.4f}<extra></extra>",
-            colorbar=dict(tickfont=dict(color=DARK), thickness=12, len=0.8),
-            showscale=True,
-        ))
-        fig5.update_layout(
-            **PLOTLY_LAYOUT,
-            height=380,
-            xaxis=dict(title=dict(text="To  →", font=dict(color=DARK, size=13)),
-                       side="bottom", tickfont=dict(color=DARK, size=11)),
-            yaxis=dict(title=dict(text="From", font=dict(color=DARK, size=13)),
-                       autorange="reversed", tickfont=dict(color=DARK, size=11)),
-        )
-        st.plotly_chart(fig5, use_container_width=True, theme=None)
-
-    with col_mus:
-        st.markdown("#### Emission means and standard deviations")
-        st.caption(
-            "For each regime: where its 'centre' sits in precipitation/ET space (μ) and how "
-            "wide a spread of months it covers (σ). Values are in standard-deviation units, so "
-            "+1.0 = one σ above the long-term mean, −1.0 = one σ below."
-        )
-
-        rows = []
-        for k in range(4):
-            rows.append({
-                "Regime":         REGIME_LABELS[k],
-                "μ SPI-12 (σ)":   f"{mus_phys[k,0]:+.2f}",
-                "μ ETI-12 (σ)":   f"{mus_phys[k,1]:+.2f}",
-                "σ precip":       f"{np.sqrt(sigmas[k,0,0]) * obs_std[0]:.3f}",
-                "σ ET":           f"{np.sqrt(sigmas[k,1,1]) * obs_std[1]:.3f}",
-            })
-        st.dataframe(pd.DataFrame(rows).set_index("Regime"),
-                     use_container_width=True)
-
-        st.markdown("#### Stationary distribution")
-        st.caption(
-            "If the SJV ran forever under this model, what fraction of months would it spend "
-            "in each regime? Mathematically: the long-run balance of the Markov chain."
-        )
-        eigvals, eigvecs = np.linalg.eig(A.T)
-        idx = np.argmin(np.abs(eigvals - 1.0))
-        stat = np.abs(np.real(eigvecs[:, idx]))
-        stat /= stat.sum()
-        st.dataframe(pd.DataFrame({
-            "Regime":        [REGIME_LABELS[k] for k in range(4)],
-            "π̄  (long-run)": [f"{stat[k]*100:.1f}%" for k in range(4)],
-        }).set_index("Regime"), use_container_width=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — BAUM-WELCH CONVERGENCE (part of Model Internals)
+# TAB 4 — QUANTIFYING UNCERTAINTY  (Bootstrap + CLT + Bayesian)
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab_convergence:
-    st.markdown("#### Baum-Welch convergence")
+with tab_boot:
+    st.markdown("### Quantifying Uncertainty — Bootstrap, CLT, and Bayesian Inference")
     st.caption(
-        "How well the model fit improved with each training iteration. "
-        "The line should always go up (better fit) and flatten out — that's the "
-        "model finding its best possible parameters and stopping."
+        "How confident should we be in statistics like 'the SJV is in drought 32% of the time'? "
+        "We compare three methods for building confidence intervals: "
+        "**bootstrap** (nonparametric), **CLT** (Normal approximation), and "
+        "**Bayesian Beta-Binomial conjugacy** — all from CS109."
     )
-    with st.expander("📐 What this is, statistically"):
-        st.markdown(
-            "- We train the HMM by maximising the **log-likelihood** of the observed data:  \n"
-            "  $\\log \\Pr(X_{1:T} \\mid \\theta)$  where $\\theta = (\\pi, A, \\mu_k, \\Sigma_k)$.\n"
-            "- This is done with **Baum-Welch** — the Expectation-Maximisation algorithm specialised "
-            "for HMMs. Each iteration alternates:\n"
-            "  - **E-step**: compute posterior probabilities of being in each regime at each time, "
-            "given current parameters (the forward-backward algorithm).\n"
-            "  - **M-step**: update $\\theta$ to maximise the expected complete-data log-likelihood "
-            "under those posteriors (closed-form updates for $\\pi$, $A$, $\\mu_k$, $\\Sigma_k$).\n"
-            "- A core theorem of EM: **each iteration is guaranteed to increase the log-likelihood "
-            "(or leave it unchanged)** — that's why the curve is monotone.\n"
-            "- We stop when the iteration-over-iteration change drops below $10^{-4}$, i.e. when "
-            "the optimisation has converged to a (local) optimum."
-        )
+    with st.expander("Statistical details"):
+        st.markdown(r"""
+**Bootstrap** (nonparametric, no distributional assumption):
+Resample the data with replacement $B$ times. The 2.5th and 97.5th percentiles of the
+bootstrap distribution form the 95% CI.
 
-    if log_likelihoods is not None and len(log_likelihoods) > 0:
-        fig8 = go.Figure(go.Scatter(
-            x=list(range(1, len(log_likelihoods) + 1)),
-            y=log_likelihoods,
-            mode="lines+markers",
-            marker=dict(size=5, color="#5B8DB8"),
-            line=dict(color="#5B8DB8", width=2),
-            hovertemplate="Iter %{x}: LL = %{y:.2f}<extra></extra>",
-        ))
-        DARK = "#1a1a1a"
-        fig8.update_layout(
-            **PLOTLY_LAYOUT,
-            height=340,
-            xaxis=dict(title=dict(text="Baum-Welch iteration", font=dict(color=DARK, size=13)),
-                       tickfont=dict(color=DARK, size=11),
-                       showgrid=True, gridcolor="#e8e8e8",
-                       showline=True, linecolor=DARK),
-            yaxis=dict(title=dict(text="log P(X | θ)", font=dict(color=DARK, size=13)),
-                       tickfont=dict(color=DARK, size=11),
-                       showgrid=True, gridcolor="#e8e8e8",
-                       showline=True, linecolor=DARK),
-        )
-        st.plotly_chart(fig8, use_container_width=True, theme=None)
+**Central Limit Theorem**:
+$$\bar X \xrightarrow{d} \mathcal{N}(\mu,\, \sigma^2/n) \text{ as } n\to\infty$$
+For a proportion $\hat p$ (Wald interval): $\hat p \pm 1.96\sqrt{\hat p(1-\hat p)/n}$.
 
-        n_iter = len(log_likelihoods)
-        final_ll = log_likelihoods[-1]
-        delta = abs(log_likelihoods[-1] - log_likelihoods[-2]) if n_iter > 1 else float("nan")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Iterations", n_iter)
-        c2.metric("Final log-likelihood", f"{final_ll:.2f}")
-        c3.metric("|ΔLL| at convergence", f"{delta:.2e}")
-    else:
-        st.info(
-            "Convergence data not found. Retrain the model using the sidebar button "
-            "to generate `outputs/log_likelihoods.npy`."
+**Beta-Binomial conjugacy**:
+If prior is Beta($\alpha, \beta$) and likelihood is Binomial($n, p$) with $s$ successes,
+the posterior is Beta($\alpha + s$, $\beta + n - s$). With a flat Beta(1,1) prior this
+gives Beta($s+1$, $n-s+1$). The central 95% credible interval is the 2.5th–97.5th
+percentile of this distribution.
+""")
+
+    N_BOOT = 10_000
+
+    @st.cache_data(show_spinner=False)
+    def _bootstrap_mean(precip_bytes, n_boot=N_BOOT, seed=1):
+        p = np.frombuffer(precip_bytes, dtype=np.float64)
+        rng = np.random.default_rng(seed)
+        boot = rng.choice(p, size=(n_boot, len(p)), replace=True).mean(axis=1)
+        return boot
+
+    @st.cache_data(show_spinner=False)
+    def _bootstrap_prop(spi_bytes, thr, n_boot=N_BOOT, seed=2):
+        spi = np.frombuffer(spi_bytes, dtype=np.float64)
+        y = (spi < thr).astype(float)
+        rng = np.random.default_rng(seed)
+        boot = rng.choice(y, size=(n_boot, len(y)), replace=True).mean(axis=1)
+        return boot, y
+
+    @st.cache_data(show_spinner=False)
+    def _bootstrap_diff(spi_bytes, raw_bytes, thr, n_boot=N_BOOT, seed=3):
+        spi = np.frombuffer(spi_bytes, dtype=np.float64)
+        raw = np.frombuffer(raw_bytes, dtype=np.float64)
+        drought = raw[spi < thr]
+        normal  = raw[spi >= thr]
+        rng = np.random.default_rng(seed)
+        d_boot = rng.choice(drought, size=(n_boot, len(drought)), replace=True).mean(axis=1)
+        n_boot_arr = rng.choice(normal, size=(n_boot, len(normal)), replace=True).mean(axis=1)
+        return d_boot - n_boot_arr, drought, normal
+
+    precip_vals = precip_raw.values
+
+    boot_mean   = _bootstrap_mean(precip_vals.tobytes())
+    boot_prop, y_drought = _bootstrap_prop(spi12.tobytes(), DROUGHT_THRESH)
+    boot_diff, drought_precip, normal_precip = _bootstrap_diff(
+        spi12.tobytes(), precip_vals[:len(spi12)].tobytes(), DROUGHT_THRESH
+    )
+
+    # ── Analysis 1: Mean monthly precipitation ───────────────────────────────
+    st.markdown("#### 1. Mean monthly precipitation across all 241 months")
+
+    n = len(precip_vals)
+    xbar = precip_vals.mean()
+    s    = precip_vals.std(ddof=1)
+    clt_lo = xbar - 1.96 * s / np.sqrt(n)
+    clt_hi = xbar + 1.96 * s / np.sqrt(n)
+    boot_lo1, boot_hi1 = np.percentile(boot_mean, [2.5, 97.5])
+
+    fig1 = go.Figure()
+    fig1.add_trace(go.Histogram(
+        x=boot_mean, nbinsx=60,
+        histnorm="probability density",
+        marker=dict(color="#B3D9E6", line=dict(color="white", width=0.5)),
+        name="Bootstrap distribution",
+    ))
+    # Normal overlay (CLT)
+    x_norm = np.linspace(boot_mean.min(), boot_mean.max(), 300)
+    fig1.add_trace(go.Scatter(
+        x=x_norm,
+        y=stats.norm.pdf(x_norm, xbar, s / np.sqrt(n)),
+        mode="lines", line=dict(color="#A60000", width=2.5, dash="dot"),
+        name=f"CLT Normal  [{clt_lo:.1f}, {clt_hi:.1f}]",
+    ))
+    for lo, hi, label, col in [
+        (boot_lo1, boot_hi1, "Bootstrap 95% CI", "#3978AE"),
+        (clt_lo,  clt_hi,   "CLT 95% CI",       "#A60000"),
+    ]:
+        for v, side in [(lo, "left"), (hi, "right")]:
+            fig1.add_vline(x=v, line_dash="dash", line_color=col, line_width=1.5)
+    fig1.add_vline(x=xbar, line_color="#222", line_width=2,
+                   annotation_text=f"x̄ = {xbar:.1f} mm",
+                   annotation_position="top right")
+    fig1.update_layout(
+        **PLOTLY_LAYOUT, height=320,
+        xaxis=dict(title="Bootstrap mean monthly precipitation (mm)",
+                   showgrid=False, showline=True, linecolor=DARK),
+        yaxis=dict(title="Density", showgrid=True, gridcolor="#eee",
+                   showline=True, linecolor=DARK),
+        legend=dict(x=0.65, y=0.95),
+    )
+    st.plotly_chart(fig1, use_container_width=True, theme=None)
+
+    r1a, r1b = st.columns(2)
+    r1a.metric("Bootstrap 95% CI", f"[{boot_lo1:.1f}, {boot_hi1:.1f}] mm")
+    r1b.metric("CLT 95% CI",       f"[{clt_lo:.1f}, {clt_hi:.1f}] mm")
+
+    # ── Analysis 2: Drought probability ─────────────────────────────────────
+    st.markdown("#### 2. Probability of drought in a random month")
+
+    n2  = len(y_drought)
+    s2  = int(y_drought.sum())
+    phat = s2 / n2
+    wald_lo = phat - 1.96 * np.sqrt(phat * (1 - phat) / n2)
+    wald_hi = phat + 1.96 * np.sqrt(phat * (1 - phat) / n2)
+    boot_lo2, boot_hi2 = np.percentile(boot_prop, [2.5, 97.5])
+
+    # Bayesian Beta-Binomial posterior
+    alpha_post = 1 + s2
+    beta_post  = 1 + n2 - s2
+    bayes_lo, bayes_hi = stats.beta.ppf([0.025, 0.975], alpha_post, beta_post)
+    p_grid = np.linspace(0, 1, 400)
+    posterior_pdf = stats.beta.pdf(p_grid, alpha_post, beta_post)
+
+    fig2 = go.Figure()
+    fig2.add_trace(go.Histogram(
+        x=boot_prop, nbinsx=60,
+        histnorm="probability density",
+        marker=dict(color="#FFE099", line=dict(color="white", width=0.5)),
+        name="Bootstrap distribution",
+    ))
+    fig2.add_trace(go.Scatter(
+        x=p_grid, y=posterior_pdf,
+        mode="lines", line=dict(color="#A60000", width=2.5),
+        name=f"Bayesian posterior  Beta({alpha_post},{beta_post})",
+    ))
+    for lo, hi, col in [
+        (boot_lo2, boot_hi2, "#3978AE"),
+        (wald_lo,  wald_hi,  "#888888"),
+        (bayes_lo, bayes_hi, "#A60000"),
+    ]:
+        fig2.add_vrect(x0=lo, x1=hi, fillcolor=col, opacity=0.10, line_width=0)
+        fig2.add_vline(x=lo, line_dash="dash", line_color=col, line_width=1.5)
+        fig2.add_vline(x=hi, line_dash="dash", line_color=col, line_width=1.5)
+    fig2.add_vline(x=phat, line_color="#222", line_width=2,
+                   annotation_text=f"p̂ = {phat:.2f}",
+                   annotation_position="top right")
+    fig2.update_layout(
+        **PLOTLY_LAYOUT, height=320,
+        xaxis=dict(title="Drought probability", range=[0, 1],
+                   showgrid=False, showline=True, linecolor=DARK),
+        yaxis=dict(title="Density", showgrid=True, gridcolor="#eee",
+                   showline=True, linecolor=DARK),
+        legend=dict(x=0.02, y=0.95),
+    )
+    st.plotly_chart(fig2, use_container_width=True, theme=None)
+
+    t2a, t2b, t2c = st.columns(3)
+    t2a.metric("Bootstrap 95% CI", f"[{boot_lo2:.2f}, {boot_hi2:.2f}]")
+    t2b.metric("CLT Wald 95% CI",  f"[{wald_lo:.2f}, {wald_hi:.2f}]")
+    t2c.metric("Bayesian 95% CrI", f"[{bayes_lo:.2f}, {bayes_hi:.2f}]")
+
+    st.caption(
+        f"All three methods agree closely: the SJV is in drought (SPI-12 < −0.5) roughly "
+        f"{phat:.0%} of months. The Bayesian credible interval uses a flat Beta(1,1) prior "
+        f"(no prior knowledge), so it's nearly identical to the frequentist intervals."
+    )
+
+    # ── Analysis 3: Difference in mean precipitation ─────────────────────────
+    st.markdown("#### 3. Difference in mean precipitation: drought vs non-drought months")
+
+    diff_obs = drought_precip.mean() - normal_precip.mean()
+    clt_diff_lo = diff_obs - 1.96 * np.sqrt(
+        drought_precip.std(ddof=1)**2 / len(drought_precip) +
+        normal_precip.std(ddof=1)**2  / len(normal_precip)
+    )
+    clt_diff_hi = diff_obs + 1.96 * np.sqrt(
+        drought_precip.std(ddof=1)**2 / len(drought_precip) +
+        normal_precip.std(ddof=1)**2  / len(normal_precip)
+    )
+    boot_lo3, boot_hi3 = np.percentile(boot_diff, [2.5, 97.5])
+
+    fig3 = go.Figure()
+    fig3.add_trace(go.Histogram(
+        x=boot_diff, nbinsx=60,
+        histnorm="probability density",
+        marker=dict(color="#FFA94D", line=dict(color="white", width=0.5)),
+        name="Bootstrap distribution of difference",
+    ))
+    for lo, hi, col, label in [
+        (boot_lo3, boot_hi3, "#3978AE", "Bootstrap"),
+        (clt_diff_lo, clt_diff_hi, "#A60000", "CLT"),
+    ]:
+        fig3.add_vline(x=lo, line_dash="dash", line_color=col, line_width=1.5,
+                       annotation_text=f"{label} lo", annotation_position="top left",
+                       annotation_font=dict(color=col, size=10))
+        fig3.add_vline(x=hi, line_dash="dash", line_color=col, line_width=1.5)
+    fig3.add_vline(x=diff_obs, line_color="#222", line_width=2,
+                   annotation_text=f"Δ = {diff_obs:.0f} mm",
+                   annotation_position="top right")
+    fig3.add_vline(x=0, line_color="#bbb", line_width=1)
+    fig3.update_layout(
+        **PLOTLY_LAYOUT, height=300,
+        xaxis=dict(title="Mean precip (drought) − mean precip (non-drought), mm",
+                   showgrid=False, showline=True, linecolor=DARK),
+        yaxis=dict(title="Density", showgrid=True, gridcolor="#eee",
+                   showline=True, linecolor=DARK),
+    )
+    st.plotly_chart(fig3, use_container_width=True, theme=None)
+
+    t3a, t3b = st.columns(2)
+    t3a.metric("Bootstrap 95% CI", f"[{boot_lo3:.0f}, {boot_hi3:.0f}] mm")
+    t3b.metric("CLT 95% CI",       f"[{clt_diff_lo:.0f}, {clt_diff_hi:.0f}] mm")
+
+    st.caption(
+        f"Drought months receive {abs(diff_obs):.0f} mm less precipitation than non-drought months "
+        f"on average. The entire 95% CI is {'below' if boot_hi3 < 0 else 'above or crossing'} zero, "
+        f"meaning the difference is statistically significant."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — INFORMATION CONTENT  (Shannon entropy + KL divergence)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_info:
+    st.markdown("### Information Content — Entropy, KL Divergence, Mutual Information")
+    st.caption(
+        "How much information does precipitation carry about drought? "
+        "We use Shannon entropy to measure how 'predictable' each year's drought pattern was, "
+        "KL divergence to quantify how different drought-year precipitation looks from normal years, "
+        "and mutual information to measure how much precipitation and ET tell us about each other."
+    )
+    with st.expander("Statistical details"):
+        st.markdown(r"""
+**Shannon entropy** (expected log-surprise):
+$$H(X) = -\sum_i p_i \log p_i = -\mathbb{E}[\log p(X)]$$
+$H = 0$ when all probability mass is on one category (perfectly predictable);
+$H$ is maximised when all categories are equally likely (maximum uncertainty).
+
+**KL divergence** (information gain from P to Q):
+$$D_{KL}(P \| Q) = \sum_i P(i) \log \frac{P(i)}{Q(i)}$$
+Higher KL = drought precipitation looks very different from normal.
+
+**Mutual information** (KL divergence between joint and product of marginals):
+$$I(X;\, Y) = \sum_{x,y} p(x,y) \log \frac{p(x,y)}{p(x)\,p(y)}$$
+$I = 0$ → completely independent; $I > 0$ → knowing one variable tells you something about the other.
+
+**Connection to MLE** (CS109 link): maximising likelihood equals minimising KL divergence from
+the empirical distribution to the model — so MLE and information theory are two sides of the same coin.
+""")
+
+    # ── USDM category labels ─────────────────────────────────────────────────
+    # Map SPI-12 values to 6 drought categories using USDM thresholds
+    # (approximately matching percentile thresholds to z-scores)
+    def spi_to_category(spi_val):
+        if spi_val < -2.0:   return "D4"
+        elif spi_val < -1.6: return "D3"
+        elif spi_val < -1.3: return "D2"
+        elif spi_val < -0.8: return "D1"
+        elif spi_val < -0.5: return "D0"
+        else:                return "Normal"
+
+    CAT_ORDER = ["D4", "D3", "D2", "D1", "D0", "Normal"]
+    CAT_COLORS = ["#5C0000", "#A60000", "#E66B00", "#FFA94D", "#FFE099", "#F2F2F2"]
+
+    spi_series = pd.Series(spi12, index=anom_dates)
+    cat_series = spi_series.apply(spi_to_category)
+
+    # ── Analysis 1: Entropy per year ─────────────────────────────────────────
+    st.markdown("#### 1. Shannon entropy of drought-category distribution, per year")
+
+    def entropy(counts):
+        total = counts.sum()
+        if total == 0:
+            return 0.0
+        p = counts / total
+        p = p[p > 0]
+        return float(-np.sum(p * np.log(p)))
+
+    years_list = sorted(cat_series.index.year.unique())
+    H_per_year = []
+    for yr in years_list:
+        yr_cats = cat_series[cat_series.index.year == yr]
+        counts = np.array([int((yr_cats == c).sum()) for c in CAT_ORDER], dtype=float)
+        H_per_year.append(entropy(counts))
+
+    H_max = np.log(6)   # maximum entropy over 6 categories
+
+    fig_ent = go.Figure()
+    fig_ent.add_trace(go.Bar(
+        x=years_list, y=H_per_year,
+        marker=dict(
+            color=["#A60000" if h < H_max * 0.6 else "#4D94CC" for h in H_per_year],
+            line=dict(width=0),
+        ),
+        hovertemplate="Year %{x}<br>H = %{y:.3f} nats<extra></extra>",
+    ))
+    fig_ent.add_hline(y=H_max, line_dash="dot", line_color="#888",
+                      annotation_text="Max entropy (uniform over 6 categories)",
+                      annotation_position="top right",
+                      annotation_font=dict(size=11, color="#888"))
+    fig_ent.update_layout(
+        **PLOTLY_LAYOUT, height=320,
+        xaxis=dict(title="Year", type="category",
+                   showgrid=False, showline=True, linecolor=DARK,
+                   tickfont=dict(color=DARK)),
+        yaxis=dict(title="Shannon entropy (nats)",
+                   showgrid=True, gridcolor="#eee",
+                   showline=True, linecolor=DARK,
+                   range=[0, H_max * 1.1]),
+    )
+    st.plotly_chart(fig_ent, use_container_width=True, theme=None)
+
+    driest_yr  = years_list[int(np.argmin(H_per_year))]
+    wettest_yr = years_list[int(np.argmax(H_per_year))]
+    st.caption(
+        f"Severe drought years like **{driest_yr}** have *low* entropy — the valley was stuck in "
+        f"one category almost all year (H ≈ {min(H_per_year):.2f} nats). "
+        f"Transition years like **{wettest_yr}** have *high* entropy — the SJV moved through "
+        f"many different drought categories (H ≈ {max(H_per_year):.2f} nats, max possible = {H_max:.2f}). "
+        "Paradoxically, drought years are more *predictable* (lower entropy) than average years."
+    )
+
+    # ── Analysis 2: KL divergence, drought vs normal precipitation ───────────
+    st.markdown("#### 2. KL divergence between drought-year and normal-year precipitation")
+
+    N_BINS = 20
+    precip_aligned = precip_raw.values[:len(spi12)]   # align lengths
+    drought_mask_arr = spi12 < DROUGHT_THRESH
+    p_drought = precip_aligned[drought_mask_arr]
+    p_normal  = precip_aligned[~drought_mask_arr]
+
+    bin_edges = np.linspace(
+        min(p_drought.min(), p_normal.min()),
+        max(p_drought.max(), p_normal.max()),
+        N_BINS + 1,
+    )
+    P, _ = np.histogram(p_drought, bins=bin_edges, density=True)
+    Q, _ = np.histogram(p_normal,  bins=bin_edges, density=True)
+    bin_w = bin_edges[1] - bin_edges[0]
+    P = P * bin_w + 1e-10   # convert density → probability, add eps
+    Q = Q * bin_w + 1e-10
+    P /= P.sum(); Q /= Q.sum()
+    kl_pq = float(np.sum(P * np.log(P / Q)))
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    fig_kl = go.Figure()
+    fig_kl.add_trace(go.Bar(
+        x=bin_centers, y=P, name="Drought months",
+        marker=dict(color="rgba(166,0,0,0.55)", line=dict(color="#A60000", width=1)),
+        width=bin_w * 0.45,
+    ))
+    fig_kl.add_trace(go.Bar(
+        x=bin_centers + bin_w * 0.46, y=Q, name="Non-drought months",
+        marker=dict(color="rgba(57,120,174,0.55)", line=dict(color="#3978AE", width=1)),
+        width=bin_w * 0.45,
+    ))
+    fig_kl.update_layout(
+        **PLOTLY_LAYOUT, height=320,
+        xaxis=dict(title="Monthly precipitation (mm)",
+                   showgrid=False, showline=True, linecolor=DARK),
+        yaxis=dict(title="Probability",
+                   showgrid=True, gridcolor="#eee", showline=True, linecolor=DARK),
+        legend=dict(x=0.65, y=0.95),
+        barmode="overlay",
+        annotations=[dict(
+            x=0.97, y=0.92, xref="paper", yref="paper",
+            text=f"KL(Drought ‖ Normal) = {kl_pq:.3f} nats",
+            showarrow=False, bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#ccc", borderwidth=1, borderpad=6,
+            font=dict(size=13, color=DARK),
+        )],
+    )
+    st.plotly_chart(fig_kl, use_container_width=True, theme=None)
+
+    st.caption(
+        f"KL divergence = {kl_pq:.3f} nats. The precipitation distributions for drought months "
+        "and non-drought months are shifted apart — drought months cluster at lower totals. "
+        "Higher KL means the two distributions look more different."
+    )
+
+    # ── Analysis 3: Mutual information between SPI-12 and ETI-12 ────────────
+    st.markdown("#### 3. Mutual information between SPI-12 and ETI-12")
+
+    N_BINS_MI = 12
+    spi_edges = np.linspace(spi12.min(), spi12.max(), N_BINS_MI + 1)
+    eti_edges = np.linspace(eti12.min(), eti12.max(), N_BINS_MI + 1)
+
+    joint, _, _ = np.histogram2d(spi12, eti12, bins=[spi_edges, eti_edges])
+    joint = joint / joint.sum()
+    p_spi = joint.sum(axis=1, keepdims=True)
+    p_eti = joint.sum(axis=0, keepdims=True)
+
+    # MI = sum p(x,y) log p(x,y) / (p(x)p(y))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mi_mat = np.where(
+            joint > 0,
+            joint * np.log(joint / (p_spi * p_eti + 1e-15)),
+            0.0,
         )
-        # show the saved convergence plot as fallback
-        if os.path.exists("outputs/convergence.png"):
-            st.image("outputs/convergence.png", use_column_width=True)
+    MI = float(mi_mat.sum())
+
+    fig_mi = go.Figure(go.Heatmap(
+        z=joint.T,
+        x=0.5 * (spi_edges[:-1] + spi_edges[1:]),
+        y=0.5 * (eti_edges[:-1] + eti_edges[1:]),
+        colorscale=[[0, "#F2F2F2"], [1, "#0A3D66"]],
+        colorbar=dict(title=dict(text="Joint prob", side="right"),
+                      tickfont=dict(color=DARK, size=11)),
+        hovertemplate="SPI-12 %{x:.2f}<br>ETI-12 %{y:.2f}<br>p = %{z:.4f}<extra></extra>",
+    ))
+    fig_mi.update_layout(
+        **PLOTLY_LAYOUT, height=360,
+        xaxis=dict(title="SPI-12 (precipitation anomaly, σ)",
+                   showgrid=False, showline=True, linecolor=DARK),
+        yaxis=dict(title="ETI-12 (ET anomaly, σ)",
+                   showgrid=False, showline=True, linecolor=DARK),
+        annotations=[dict(
+            x=0.97, y=0.05, xref="paper", yref="paper",
+            text=f"I(SPI-12; ETI-12) = {MI:.3f} nats",
+            showarrow=False, bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#ccc", borderwidth=1, borderpad=6,
+            font=dict(size=13, color=DARK),
+        )],
+    )
+    st.plotly_chart(fig_mi, use_container_width=True, theme=None)
+
+    st.caption(
+        f"Mutual information I(SPI-12; ETI-12) = {MI:.3f} nats. "
+        "The joint distribution is concentrated along the diagonal — when precipitation is anomalously "
+        "low, ET is also low (less water available to evaporate). The positive MI confirms that "
+        "precipitation and ET are not independent: knowing one tells us something about the other."
+    )

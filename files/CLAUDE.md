@@ -1,100 +1,116 @@
-# San Joaquin Valley Drought Regime HMM — CS109 Challenge Project
+# Statistical Drought Analysis — San Joaquin Valley
 
-## Project Goal
-Fit a 4-state Gaussian HMM to daily gridded precipitation + evapotranspiration data
-for the San Joaquin Valley (2000–2020) to discover hidden climate/drought regimes.
-This is a CS109 Challenge submission — all probability must be implemented from scratch.
+## Project goal
 
-## Academic Constraint (CRITICAL)
-This is submitted to Stanford CS109. Do NOT use sklearn's HMM, hmmlearn, or any library
-that implements Baum-Welch or Viterbi internally. We implement everything ourselves:
-- Forward-backward algorithm
-- Baum-Welch (EM) for parameter estimation
-- Viterbi for decoding
-- Multivariate Gaussian emission likelihoods
+Build a Streamlit dashboard that analyses 21 years of San Joaquin Valley precipitation
+and evapotranspiration data using **probabilistic methods drawn directly from the
+CS109 syllabus**. This is the CS109 Spring 2026 Challenge Project.
 
-numpy and scipy.stats.multivariate_normal are allowed (for numerical stability only).
-matplotlib and pandas are allowed for data loading and visualization.
+CS109 topics that MUST appear in the analysis (this drives everything else):
 
-## Model Specification
-- K = 4 hidden states (climate regimes, labels learned post-hoc)
-- Observations: X_t = [precip_t, ET_t] in R^2, one per day
-- Initial distribution π: uniform [0.25, 0.25, 0.25, 0.25]
-- Transition matrix A: 4x4, rows sum to 1
-- Emission: X_t | Z_t=k ~ N(μ_k, Σ_k), multivariate Gaussian
-- Parameters learned via Baum-Welch (EM)
+- Continuous random variables (Normal, Exponential, **Gamma**)
+- **MLE** (closed-form for Normal/Exp, numerical for Gamma)
+- **Logistic regression** (binary drought classification)
+- **Linear regression** (drought-severity prediction)
+- **Information theory** — Shannon entropy, KL divergence
+- **Bootstrap sampling** + Central Limit Theorem (confidence intervals)
+- **Bayesian inference** — Beta-Binomial conjugacy
 
-## Project Structure
+CS109 topics that are explicitly OUT OF SCOPE:
+
+- Hidden Markov Models, Baum-Welch, Viterbi, forward-backward — these are NOT
+  in CS109 and were the basis of a previous (now-abandoned) version of this
+  project. If you find HMM references in old code, treat them as legacy and
+  remove or replace.
+- Multivariate Gaussian, EM algorithm, Markov chains — out of scope.
+
+## Repository layout
+
 ```
-sjv_drought_hmm/
-├── CLAUDE.md               ← you are here
+files/
+├── CLAUDE.md            ← you are here
+├── PROJECT_PLAN.md      ← the analyses to build (read second)
+├── app.py               ← Streamlit dashboard (legacy HMM logic to be replaced)
+├── data_loader.py       ← NetCDF loaders (KEEP — these are good)
 ├── data/
-│   └── README.md           ← data download instructions
-├── src/
-│   ├── hmm.py              ← GaussianHMM class (core model)
-│   ├── forward_backward.py ← E-step: alpha, beta, gamma, xi
-│   ├── viterbi.py          ← decoding most likely state sequence
-│   ├── emissions.py        ← multivariate Gaussian log-likelihood
-│   └── data_loader.py      ← load/preprocess NetCDF or CSV data
-├── notebooks/
-│   └── exploration.ipynb   ← EDA and results visualization
-├── outputs/
-│   └── (figures, learned params, decoded sequences)
-├── tests/
-│   └── test_hmm.py         ← unit tests for each algorithm
-└── main.py                 ← train model, decode, save outputs
+│   ├── gpm_sjv_subset.nc        ← NASA GPM precipitation, daily, 38×35 grid
+│   └── openet_sjv_subset.nc     ← OpenET ET, monthly, ~800×700 grid
+├── outputs/             ← legacy HMM outputs — safe to overwrite
+└── (hmm.py, viterbi.py, forward_backward.py, emissions.py, main.py)
+                         ← legacy HMM code. Remove or repurpose.
 ```
 
-## Key Equations to Implement (do not deviate)
+## Data
 
-### Emission log-likelihood
-log P(X_t | Z_t=k) = log N(X_t; μ_k, Σ_k)
-Use log-space throughout to avoid underflow.
+Two NetCDF files, both already spatially subset to the SJV:
 
-### Forward pass (α)
-α_1(k) = π_k * N(X_1; μ_k, Σ_k)
-α_t(k) = N(X_t; μ_k, Σ_k) * Σ_j [α_{t-1}(j) * A_{jk}]
-Scale at each step (Rabiner scaling) to avoid underflow.
+**`data/gpm_sjv_subset.nc`** — NASA GPM IMERG Late-Run precipitation
+- Variables: `precipitation` (time, lat, lon) daily mm; `precip_mean` (time) SJV-averaged daily mm
+- Grid: 38 lat × 35 lon at 10 km, with ~973 NaN cells outside the SJV polygon
+- Coverage: 2000-01-01 → 2020-12-31 (7,671 days)
 
-### Backward pass (β)
-β_T(k) = 1
-β_t(k) = Σ_j [A_{kj} * N(X_{t+1}; μ_j, Σ_j) * β_{t+1}(j)]
-Use same scaling factors from forward pass.
+**`data/openet_sjv_subset.nc`** — OpenET Monthly Ensemble evapotranspiration
+- Variables: `et` (time, lat, lon) mm/month; `et_mean` (time) SJV-averaged mm/month
+- Grid: 801 lat × 731 lon at 500 m (mismatched with GPM — use the `_mean` variables for spatial-mean work)
+- Coverage: 2000-01 → 2020-12 (252 months)
 
-### E-step posteriors
-γ_t(k) = α_t(k) * β_t(k) / Σ_j [α_t(j) * β_t(j)]
-ξ_t(j,k) = α_t(j) * A_{jk} * N(X_{t+1}; μ_k, Σ_k) * β_{t+1}(k) / normalizer
+The existing `data_loader.py` already implements:
+- `load_netcdf(precip_path, et_path)` — returns monthly SPI-12 / ETI-12 z-score anomalies (T=241 months, 2 features). Useful for any temporal analysis at the monthly level.
+- `load_spatial_percentile(precip_path)` — returns per-cell drought percentile ranks (T=241, lat=38, lon=35) with non-SJV cells as NaN. Used by the map.
 
-### M-step updates
-π_k       = γ_1(k)
-A_{jk}    = Σ_t ξ_t(j,k) / Σ_t Σ_k ξ_t(j,k)
-μ_k       = Σ_t γ_t(k) * X_t / Σ_t γ_t(k)
-Σ_k       = Σ_t γ_t(k) * (X_t - μ_k)(X_t - μ_k)^T / Σ_t γ_t(k)
+For the new analyses you will also need raw monthly totals (no z-scoring), which means
+adding a simpler loader. Easy lift.
 
-### Viterbi
-delta_1(k) = log π_k + log N(X_1; μ_k, Σ_k)
-delta_t(k) = log N(X_t; μ_k, Σ_k) + max_j [delta_{t-1}(j) + log A_{jk}]
-Backtrack psi pointers to recover Z*_{1:T}.
+## The Streamlit app to preserve
 
-## Convergence
-Run Baum-Welch until |log-likelihood change| < 1e-4 or max 200 iterations.
-Log the log-likelihood at each iteration (should monotonically increase).
+`app.py` already implements an interactive dashboard with 4 tabs and good UX scaffolding.
+**Most of this scaffolding is reusable**; the analyses inside the tabs are what changes.
 
-## Initialization Strategy
-Initialize μ_k with k-means on the raw observations (avoids label-switching).
-Initialize Σ_k as identity matrices.
-Initialize A as near-uniform with small random noise (rows must sum to 1).
+Reusable infrastructure in `app.py`:
 
-## Numerical Notes
-- Always work in log-space for likelihoods
-- Use Rabiner scaling in forward-backward (not log-sum-exp, simpler to implement)
-- Add 1e-6 * I regularization to Σ_k estimates to prevent singular matrices
-- Clip γ values away from zero before division
+- `PLOTLY_LAYOUT` design tokens for consistent styling
+- Page-level CSS (hides Streamlit's running widget during animation, etc.)
+- `@st.cache_data` loader wrappers
+- Drought Map tab — the spatial heatmap with animation, slider, date picker, calendar
+  view of drought %. **This entire tab is CS109-agnostic and should stay as-is.**
+- The 4-tab layout pattern, sidebar layout, "Quick Statistics" cards at top
+- The `_sjv_outline` cell-edge-tracing helper used for the SJV map boundary
+- The `@st.expander("Statistical details")` pattern for showing math under each chart
 
-## Output Goals
-1. Learned parameters: π, A, {μ_k, Σ_k} for k=1..4
-2. Decoded regime sequence Z*_{1:T} over 2000–2020
-3. Regime interpretation: which state = wet / dry / hot-dry / moderate?
-4. Transition matrix heatmap
-5. Regime duration statistics (mean days per regime)
-6. Seasonal regime distribution (which regimes dominate which months?)
+Reusable utility files:
+
+- `data_loader.py` — keep
+- (Anything else in the repo that's HMM-specific can be removed)
+
+## Visual identity
+
+The existing app uses a clean, white-background, professional style. Keep it.
+
+- Font: Inter / system-ui
+- Plot backgrounds: white; axes dark `#1a1a1a` / `#222`
+- Colour palette for drought categories matches the U.S. Drought Monitor:
+  D4 `#5C0000`, D3 `#A60000`, D2 `#E66B00`, D1 `#FFA94D`, D0 `#FFE099`,
+  Normal `#F2F2F2`, then wet end blue → navy `#0A3D66`
+- Captions are plain English; mathematical details live in `st.expander("Statistical details")` blocks
+
+## How to run
+
+```bash
+streamlit run app.py
+```
+
+Python deps: `streamlit, plotly, pandas, numpy, xarray, netCDF4, scipy`
+
+## What you (Claude) should do next
+
+Read **`PROJECT_PLAN.md`** for the full pivot plan. In short:
+
+1. Remove or repurpose the HMM tabs (`Drought Severity`, `Latent Regimes`, `Model Internals`).
+2. Keep `Drought Map` exactly as-is — it's pure climatology, no HMM.
+3. Build the new tabs with CS109 analyses as specified in `PROJECT_PLAN.md`.
+4. Each new chart needs a plain-English caption + a `Statistical details` expander
+   citing the relevant CS109 concept by name.
+5. Rewrite `WRITEUP.md` to reflect the new CS109-grounded analyses.
+
+The end goal: a dashboard where every tab can be pointed at and labelled with a
+specific CS109 lecture.
